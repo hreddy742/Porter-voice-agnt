@@ -1,12 +1,6 @@
-﻿import psycopg2, os
-from dotenv import load_dotenv
-load_dotenv()
+﻿from app.db import get_connection
 
-conn = psycopg2.connect(
-    host='localhost', port=5432,
-    database='porter_leads', user='porter',
-    password=os.getenv('DB_PASSWORD','')
-)
+conn = get_connection()
 cursor = conn.cursor()
 
 # Reset ANY lead that has a phone number back to research

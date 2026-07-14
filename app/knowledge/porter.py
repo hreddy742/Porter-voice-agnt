@@ -1,5 +1,5 @@
 # ============================================================
-# knowledge.py — Porter Capital Facts (v2 - Cold Outreach Voice)
+# porter.py — Porter Capital Facts (v2 - Cold Outreach Voice)
 # ============================================================
 
 PORTER_CAPITAL_KNOWLEDGE = """

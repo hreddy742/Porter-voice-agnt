@@ -1,47 +1,32 @@
 ﻿# ============================================================
-# db.py — Database connection for Porter Capital Voice Agent
+# leads.py — Database connection for Porter Capital Voice Agent
 # ============================================================
 # This file does three things:
 #   1. get_next_lead()       → find the best lead to call
 #   2. update_lead_status()  → write call result back to DB
 #   3. add_to_suppression()  → log opt-outs immediately
 #
-# Connected to: porter_leads database (your Lead Intelligence DB)
+# Connected via app.config.Settings (.env DB_* → local porter DB)
 # ============================================================
 
+from __future__ import annotations
+
 import psycopg2
-import os
-from dotenv import load_dotenv
 
-load_dotenv()
-
-# --- Database connection settings ---
-# These match your porter_leads database exactly
-DB_CONFIG = {
-    "host":     "localhost",
-    "port":     5432,
-    "database": "porter_leads",
-    "user":     "porter",
-    "password": os.getenv("DB_PASSWORD", ""),
-}
-
-# How far out to schedule a recontact when a call ends in 'callback_later'
-# (bad timing, not a genuine no). 7 days is a placeholder — the right
-# interval is a business decision John hasn't confirmed yet. Override via
-# env var rather than editing this default in code once that's settled.
-RECONTACT_DEFAULT_DAYS = int(os.getenv("RECONTACT_DEFAULT_DAYS", "7"))
+from app.config import settings
+from app.db.models import Lead
 
 
 def get_connection():
     """
-    Opens a connection to the porter_leads database.
+    Opens a connection to the configured Postgres database.
     Think of this like picking up the phone to call the database.
     Every function below calls this first, then closes it when done.
     """
-    return psycopg2.connect(**DB_CONFIG)
+    return psycopg2.connect(**settings.db_connect_kwargs())
 
 
-def get_next_lead():
+def get_next_lead() -> Lead | None:
     """
     Finds the single best lead to call right now.
 
@@ -54,7 +39,7 @@ def get_next_lead():
     6. Ordered by tier: Hot first, then Warm, then Cold
     7. Within same tier, higher score goes first
 
-    Returns a dictionary with all lead details,
+    Returns a Lead model with all lead details,
     or None if no leads are available.
 
     NOTE: does not yet consider recontact_at. sales_status filtering
@@ -137,24 +122,22 @@ def get_next_lead():
     cursor.close()
     conn.close()
 
-    # No leads available right now
     if row is None:
         return None
 
-    # Return as a clean dictionary so the agent can read it easily
-    return {
-        "company_name":      row[0],
-        "city":              row[1],
-        "state":             row[2],
-        "industry":          row[3],
-        "naics_code":        row[4],
-        "website_domain":    row[5],
-        "phone":             row[6],
-        "lead_candidate_id": str(row[7]),
-        "tier":              row[8],
-        "current_score":     row[9],
-        "why_now_summary":   row[10],
-    }
+    return Lead(
+        company_name=row[0],
+        city=row[1],
+        state=row[2],
+        industry=row[3],
+        naics_code=row[4],
+        website_domain=row[5],
+        phone=row[6],
+        lead_candidate_id=str(row[7]),
+        tier=row[8],
+        current_score=row[9],
+        why_now_summary=row[10],
+    )
 
 
 def update_lead_status(lead_candidate_id, new_status):
@@ -179,8 +162,8 @@ def update_lead_status(lead_candidate_id, new_status):
 
     if new_status == 'callback_later':
         # recontact_at added via migrate_add_recontact_at.py. The interval is
-        # a placeholder (RECONTACT_DEFAULT_DAYS, default 7) pending a real
-        # business decision on cadence — see db.py's RECONTACT_DEFAULT_DAYS.
+        # a placeholder (settings.recontact_default_days, default 7) pending a
+        # real business decision on cadence.
         cursor.execute("""
             UPDATE lead_candidates
             SET
@@ -188,7 +171,7 @@ def update_lead_status(lead_candidate_id, new_status):
                 recontact_at = now() + (%s || ' days')::interval,
                 updated_at   = now()
             WHERE id = %s
-        """, (new_status, RECONTACT_DEFAULT_DAYS, lead_candidate_id))
+        """, (new_status, settings.recontact_default_days, lead_candidate_id))
     else:
         cursor.execute("""
             UPDATE lead_candidates
@@ -222,7 +205,6 @@ def add_to_suppression(company_name, website_domain, reason="opted_out"):
     conn   = get_connection()
     cursor = conn.cursor()
 
-    # Add by company name
     cursor.execute("""
         INSERT INTO suppression_list
             (match_type, match_value, reason, source)
@@ -231,7 +213,6 @@ def add_to_suppression(company_name, website_domain, reason="opted_out"):
         ON CONFLICT DO NOTHING
     """, (company_name, reason))
 
-    # Add by domain if we have it
     if website_domain:
         cursor.execute("""
             INSERT INTO suppression_list

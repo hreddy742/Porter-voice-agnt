@@ -1,16 +1,6 @@
-﻿import psycopg2
-from dotenv import load_dotenv
-import os
+﻿from app.db import get_connection
 
-load_dotenv()
-
-conn = psycopg2.connect(
-    host="localhost",
-    port=5432,
-    database="porter_leads",
-    user="porter",
-    password=os.getenv("DB_PASSWORD", "")
-)
+conn = get_connection()
 cursor = conn.cursor()
 
 print('--- Total companies ---')
