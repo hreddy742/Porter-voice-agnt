@@ -1,10 +1,14 @@
 ﻿# ============================================================
 # db.py — Database connection for Porter Capital Voice Agent
 # ============================================================
-# This file does three things:
-#   1. get_next_lead()       → find the best lead to call
-#   2. update_lead_status()  → write call result back to DB
-#   3. add_to_suppression()  → log opt-outs immediately
+# This file does seven things:
+#   1. get_connection()      → open a DB connection
+#   2. create_call()         → start a call record, return its ID
+#   3. add_call_turn()       → persist one transcript turn
+#   4. finish_call()         → mark a call record complete
+#   5. get_next_lead()       → find the best lead to call
+#   6. update_lead_status()  → write call result back to DB
+#   7. add_to_suppression()  → log opt-outs immediately
 #
 # Connected to: porter_leads database (your Lead Intelligence DB)
 # ============================================================

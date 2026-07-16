@@ -10,7 +10,7 @@ from livekit.plugins import cartesia
 
 load_dotenv()
 
-VOICE_ID = "f039066f-cdb7-45ed-b51d-1034ae2f04a0"  # same voice used in agent.py
+VOICE_ID = "a33f7a4c-100f-41cf-a1fd-5822e8fc253f"  # same voice used in agent.py
 
 
 async def main():

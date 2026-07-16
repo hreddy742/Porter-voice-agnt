@@ -17,19 +17,20 @@ is available.
   after its default keep_alive window. A "cold" first call (model not
   currently loaded) measured ~24s before the tool call — still much
   better than the ~45s thinking-mode hang, but still a noticeable pause
-  on a live call. Not yet mitigated. Options if this matters in practice:
-  a warm-up ping to the qwen model at worker startup, or raising
-  Ollama's keep_alive so the model stays resident between calls.
+  on a live call. Mitigated: `prewarm_qwen()` (agent.py / agent_v2.py)
+  runs as `WorkerOptions.prewarm_fnc`, pinging the qwen model once at
+  worker startup, combined with `OLLAMA_KEEP_ALIVE` so the model stays
+  resident between calls instead of unloading on its default window.
 
 ## livekit-rtc webrtc-sys panic fix
 - Bug: github.com/livekit/rust-sdks/issues/944
 - Fix merged: rust-sdks PR #1098 (2026-07-09)
-- Current livekit-agents (1.6.5) still pins livekit==1.1.13,
+- Current livekit-agents (1.6.4) still pins livekit==1.1.12,
   which predates the fix
 - Workaround applied: job_executor_type=JobExecutorType.PROCESS
   in agent.py (isolates crash to single call, not whole worker)
 - TODO: once a livekit-agents release bundles rust-sdks with the
-  fix (check pip index versions livekit for anything past 1.1.13
+  fix (check pip index versions livekit for anything past 1.1.12
   built after 2026-07-09), upgrade and remove/reconsider the
   PROCESS workaround if THREAD mode is preferred for performance
 
@@ -48,23 +49,20 @@ is available.
   the upstream fix ships in a released livekit-agents version (see TODO
   above), this caveat goes away entirely regardless of testing mode.
 
-## No full call transcript persistence (known gap, deferred)
-- Confirmed 2026-07-15: neither agent.py nor agent_v2.py persists a full
-  call transcript anywhere. The conversation only exists as live STT/LLM/
-  TTS turns inside the LiveKit pipeline process and whatever hits stdout
-  via `print()` — nothing is written to a file or the database. Once the
-  process/terminal ends, the transcript is gone permanently.
-- What IS persisted today: `lead_candidates.sales_status`/`updated_at`/
-  `recontact_at` (via `update_lead_status()`), plus the three call-notes
-  columns added by `migrate_add_call_notes_columns.py`
-  (`referral_details`, `callback_details`, `objection_text` — each holds
-  only the single most recent value, not a transcript).
-- NOT built: a dedicated `calls`/`transcript` table keyed by
-  `lead_candidate_id` (one row per call, holding the full turn-by-turn
-  transcript) would be needed for real call auditing/compliance — e.g.
-  proving what was actually said on a given call, not just the summarized
-  outcome fields. Intentionally deferred as a separate follow-up, not
-  forgotten.
+## Full call transcript persistence (shipped 2026-07-16)
+- `calls` and `call_turns` tables (`migrate_add_calls_tables.py`) store
+  one row per call plus the ordered turn-by-turn transcript.
+- `db.py` provides `create_call()` (opens the call record, returns its
+  ID), `add_call_turn()` (persists one turn), and `finish_call()` (marks
+  the call complete with its final result).
+- `call_transcript.py`'s `CallTranscriptRecorder` queues conversation
+  turns off the SDK's `conversation_item_added` event and writes them via
+  a background worker task, so persistence never blocks call audio.
+- Wired into both `agent.py` (`agent.py:1661/1718`) and `agent_v2.py`
+  (`agent_v2.py:1423/1458`) — every real call now has a full transcript
+  for auditing/compliance, not just the summarized outcome fields
+  (`sales_status`, `recontact_at`, `referral_details`,
+  `callback_details`, `objection_text`).
 
 ## OpenerTask hello-loop: VAD echo false positive (fixed 2026-07-14)
 - Bug: `on_enter`'s hello-escalation loop (agent.py `OpenerTask.on_enter`)

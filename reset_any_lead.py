@@ -12,7 +12,7 @@ cursor = conn.cursor()
 # Reset ANY lead that has a phone number back to research
 cursor.execute("""
     UPDATE lead_candidates
-    SET sales_status = 'research', updated_at = now()
+    SET sales_status = 'research', recontact_at = NULL, updated_at = now()
     WHERE company_id IN (
         SELECT company_id FROM company_contactability
         WHERE phone IS NOT NULL
