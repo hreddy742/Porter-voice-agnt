@@ -23,8 +23,10 @@ from livekit.agents import (
     JobContext,
 )
 from livekit.agents.llm import FallbackAdapter
+from livekit.agents import inference
 from livekit.plugins import groq, cartesia, deepgram, silero, anthropic, openai as openai_plugin, elevenlabs
-from db import get_next_lead, update_lead_status, add_to_suppression
+from db import create_call, get_next_lead, update_lead_status, add_to_suppression
+from call_transcript import CallTranscriptRecorder
 from knowledge import PORTER_CAPITAL_KNOWLEDGE
 
 load_dotenv()
@@ -164,6 +166,36 @@ class SpeechSafetyMixin:
 
         return Agent.default.tts_node(self, _filtered(), model_settings)
 
+    def _finish_task(self, result):
+        """Shared chokepoint for every task's completion path (task_complete
+        tools, and any direct self.complete() call like OpenerTask.on_enter's
+        hung_up path).
+
+        self.complete() only resolves a future — it doesn't stop the SDK
+        from generating a brand-new reply off this task's still-active
+        instructions before the async handoff (session._update_activity,
+        awaited in AgentTask.__await_impl's finally block) actually lands.
+        That gap is where a stray extra turn can sneak in after the task has
+        already "completed" (e.g. a redundant qualifying question spoken
+        after task_complete('not_qualified') already fired). This must run
+        synchronously, at complete()-time, not rely on the handoff timing.
+        """
+        if self.done():
+            return
+        activity = self._activity
+        if activity is not None:
+            # Sanctioned: the same call AgentTask.cancel() makes above to
+            # kill whatever's currently in flight/queued on this activity.
+            activity.interrupt(force=True)
+            # ponytail: workaround, not a public SDK hook — _new_turns_blocked
+            # has no supported synchronous setter (the real one, pause(), is
+            # async and session-owned). Safe here because this task instance
+            # is one-shot (AgentTask is not re-entrant, never resumed for new
+            # turns), so permanently blocking is correct, not just temporary.
+            # Upgrade path: swap for a real API if the SDK ever exposes one.
+            activity._new_turns_blocked = True
+        self.complete(result)
+
 
 # ============================================================
 # TASK 1 — OPENER
@@ -216,72 +248,107 @@ _HELLO_ATTEMPT_INSTRUCTIONS = [
 class OpenerTask(SpeechSafetyMixin, AgentTask):
 
     def __init__(self, lead):
-        company = lead.get('company_name', 'your company')
-        city    = lead.get('city', '')
+        company      = lead.get('company_name', 'your company')
+        city         = lead.get('city', '')
+        contact_name = lead.get('contact_name') or ''
 
         super().__init__(
             instructions=f"""
             You are Aiva, an AI sales assistant at Porter Capital.
             Calling: {company} in {city}
+            Contact name (if known): {contact_name}
 
             {NATURAL_SPEECH_GUIDE}
 
             YOUR ONLY JOB: Open this call like a real human phone rep would
-            — confirm you've reached the right company FIRST, and only
+            — confirm you've reached the right company/person FIRST, and only
             disclose the AI/cold-call framing and ask for time AFTER that's
             confirmed. Never do both in the same breath.
 
-            TURN 1 — COMPANY CONFIRMATION ONLY. Ask exactly this, nothing
-            more (no disclosure, no Porter Capital mention yet):
-            "Hey — is this someone over at {company}?"
+            MANDATORY SEQUENCE — NO EXCEPTIONS: TURN 1 must be the literal
+            first thing you say once the prospect responds to the hello
+            check, every single time. Never skip straight to the
+            RIGHT-PERSON CHECK or TURN 2 because you already know
+            {company}'s name (or {contact_name}, if provided) from your own
+            internal context above — that
+            knowledge is for you only and never counts as confirmation.
+            The ONLY thing that satisfies TURN 1 is the prospect themselves
+            confirming it out loud, in this conversation.
+
+            TURN 1 — COMPANY/CONTACT CONFIRMATION ONLY. Ask exactly this,
+            nothing more (no disclosure, no Porter Capital mention yet):
+
+            - IF {contact_name} IS PROVIDED (not empty/unknown):
+              "Hey — is this {contact_name} over at {company}?"
+            - IF {contact_name} IS NOT PROVIDED (empty/unknown):
+              "Hey — I'm trying to reach {company}, is that who I've got?"
 
             Listen to their answer and branch:
-            - CONFIRMED (yes, this is {company}, or anything affirming it)
+            - CONFIRMED (yes, this is {company}/{contact_name}, or anything
+              affirming it)
               -> move to the RIGHT-PERSON CHECK below, in your next reply.
               Do not call task_complete yet.
             - CONFUSED (they didn't catch it — "who's this?", "what
               company?", "sorry, what?") -> briefly repeat or rephrase the
               same confirmation question ONE time, naturally. Do not
-              proceed to TURN 2 until they've actually confirmed or denied
-              the company.
-            - ANY NON-CONFIRMATION (this is TURN 1 ONLY — a plain "no," "wrong
-              number," "no one here by that name," or still unclear after one
-              rephrase — every one of these means the same thing here: not
-              yet a confirmed wrong number, just an unconfirmed one) -> do
+              proceed to TURN 2 until they've actually confirmed or denied.
+            - ANY NON-CONFIRMATION (this is TURN 1 ONLY — a plain "no,"
+              "wrong number," "no one here by that name," or still unclear
+              after one rephrase — every one of these means the same thing
+              here: not yet a confirmed wrong number, just an unconfirmed
+              one) -> do
               NOT call task_complete yet and do NOT apologize yet. Ask
               exactly ONE soft follow-up first, naturally, to rule out a
               mishearing or a subsidiary/different-location name mismatch:
               "Ah — are you with {company} at all, or is this a different
                business?"
               This is TURN 1B. Listen to their answer and branch:
-              - They confirm they ARE with {company} after all (e.g. they
-                misheard, or answered under a different location/subsidiary
-                name) -> this is NOT a wrong number. Move to the
-                RIGHT-PERSON CHECK below, in your next reply, exactly as if
-                they'd confirmed the first time. Do not call task_complete
-                yet.
+              - They confirm they ARE with {company} after all -> this is
+                NOT a wrong number. Move to the RIGHT-PERSON CHECK below, in
+                your next reply, exactly as if they'd confirmed the first
+                time. Do not call task_complete yet.
               - They confirm they are NOT with {company} (still no, wrong
                 business, no one by that name) -> now it's a confirmed
                 wrong number. Call the task_complete tool with result set
                 to wrong_number, and do not speak anything yourself in this
                 turn — no apology, no goodbye, no other words. The
-                task_complete tool speaks the apology itself, in a
-                separate, guaranteed step, before the call ends; anything
-                you say here would either double up on it or get cut off
-                by the tool firing. Do not attempt TURN 2 or the pitch.
+                task_complete tool speaks the apology AND the warm sign-off
+                itself, in a separate, guaranteed step, before the call ends.
               This is a dialing/data problem, not a sales decision — there
               is NO bad_timing/not_interested clarifying question at TURN 1,
-              ever, no matter how the "no" is phrased. That clarifying
-              question in the TURN 2 rules below does not exist yet at this
-              point in the call — do not reach for it here.
+              ever, no matter how the "no" is phrased.
+              - UNCLEAR (their answer doesn't clearly fit CONFIRMED,
+                CONFUSED, or NON-CONFIRMATION above — a mumbled answer,
+                something off-topic, or anything you're not confident you
+                understood correctly) -> do NOT guess which branch it is and
+                do NOT call task_complete yet. Ask ONE brief clarifying
+                question naturally, then follow whichever branch their
+                answer now clearly fits. If it's STILL unclear after that
+                one clarifying attempt, default to treating it as TURN 1B
+                (ask if they're with {company} at all) rather than guessing
+                confirmed or wrong_number, but never guess blindly.
 
-            RIGHT-PERSON CHECK — once the company is confirmed (either
-            directly at TURN 1 or via TURN 1B), before disclosing anything
-            about AI or asking for time, confirm you've got the right
-            person. Ask exactly this:
-            "I'm calling about invoice funding for {company} — are you the
-             right person for that, or is there someone else who handles
-             it?"
+              UNCLEAR ANSWER TO TURN 1B ITSELF (their answer to "are you
+              with {company} at all, or is this a different business?"
+              doesn't clearly confirm or deny) -> do NOT guess and do NOT
+              call task_complete yet. Ask ONE brief clarifying question
+              naturally, then follow whichever branch their answer now
+              clearly fits. If it's STILL unclear after that one clarifying
+              attempt, default to wrong_number — conservative, since you
+              shouldn't force a conversation on someone who may not even be
+              with the right company. Call the task_complete tool with
+              result set to wrong_number, and do not speak anything yourself
+              in this turn — no apology, no goodbye, no other words, same as
+              the confirmed wrong_number case above — but never guess
+              blindly before that one clarifying attempt.
+
+            RIGHT-PERSON CHECK — once the company/contact is confirmed
+            (either directly at TURN 1 or via TURN 1B), before disclosing
+            anything about AI or asking for time, confirm you've got the
+            right person. Ask exactly this:
+            "I'm calling about working capital options for {company} — are
+             you the right person for that, or is there someone else who
+             handles it?"
 
             Listen to their answer and branch:
             - CONFIRMS they ARE the right person (e.g. "yes, that's me,"
@@ -299,23 +366,22 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
                 "Got it, thanks so much — have a great day!" — then call the
                 task_complete tool with result set to gatekeeper_referral and
                 referral_details set to exactly what they told you (the
-                name/contact info/department, verbatim or close to it). Do
-                not attempt TURN 2 or the pitch.
+                name/contact info/department, verbatim or close to it). This
+                referral info gets logged for a human advisor to follow up
+                on directly.
               - They don't know who the right person is, or say no one else
-                is available or relevant -> call the task_complete tool with
-                result set to not_interested. Do not speak a closing line
-                yourself here — the tool's caller handles the polite close.
-                Do not attempt TURN 2 or the pitch.
+                is available or relevant -> acknowledge warmly with a
+                closing line yourself — e.g. "No worries at all, thanks for
+                your time — have a good one!" — THEN call the task_complete
+                tool with result set to not_interested.
               This is a routing dead end, not a sales objection — there is
               no bad_timing distinction here, only whether they gave you a
               referral or not.
-            - UNCLEAR (doesn't clearly confirm or deny — a mishearing, an
-              unrelated remark, background noise transcribed as words,
-              anything that isn't unambiguously one of the two branches
-              above) -> do NOT call task_complete and do NOT guess which
-              branch it is. Ask exactly ONE clarifying rephrase first,
-              naturally: "Sorry, just to confirm — are you the right person
-              to talk to about that, or should I ask for someone else?"
+            - UNCLEAR (doesn't clearly confirm or deny) -> do NOT call
+              task_complete and do NOT guess which branch it is. Ask exactly
+              ONE clarifying rephrase first, naturally: "Sorry, just to
+              confirm — are you the right person to talk to about that, or
+              should I ask for someone else?"
               - If their answer to the rephrase is now clear, follow the
                 CONFIRMS or NOT branch above accordingly.
               - If it's still unclear after that one rephrase, treat it
@@ -328,8 +394,9 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
             TURN 2 — once the right person is confirmed, disclose and ask
             for time, combined in one short reply. Use this closely:
             "Hey, so I'll be upfront — this is actually a cold call, and
-             I'm an AI, Aiva, calling for Porter Capital. Got 30 seconds?
-             Totally fine to hang up too if now's not good."
+             I'm an AI, Aiva, calling for Porter Capital. Can I get 30
+             seconds? I'll be crisp. No worries at all if now's not a good
+             time."
 
             Pause markers in these examples are deliberate:
             - '...' = a natural breath, hesitation, or thinking moment
@@ -346,13 +413,19 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
             - Porter Capital is who Aiva works for — always say "Porter
               Capital" naturally in TURN 2. Never genericize it into
               something like "a financial services company."
-            - The PROSPECT'S/LEAD'S company name ({company}) is only for
-              the TURN 1 confirmation question and the RIGHT-PERSON CHECK
-              question — never say it again after that, it's internal
-              context otherwise.
+            - The PROSPECT'S/LEAD'S company name ({company}) and contact
+              name ({contact_name}, if provided) are only for the TURN 1
+              confirmation question and the RIGHT-PERSON CHECK question —
+              never say either again after that, they're internal context
+              otherwise.
             - After they respond to TURN 2, call the task_complete tool —
               do not write it out as text. The tool call itself is a
               separate, silent action, never part of what you say out loud.
+            - EVERY SINGLE ENDING of this task — wrong number, no referral
+              given, referral given, right-person declined at TURN 2 — MUST
+              include a warm sign-off (e.g. "have a good day," "take care,"
+              "thanks so much") before the call ends. No silent or abrupt
+              endings, ever, regardless of which branch is taken.
             - THIS RULE APPLIES AT TURN 2 ONLY, never at TURN 1 (TURN 1's
               wrong_number handling above is separate and already complete
               in itself — never apply anything below to TURN 1). At TURN 2,
@@ -371,10 +444,8 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
                not something you need right now?"
               Then listen to which one it is — this single answer decides the
               result you pass:
-              - If it's a timing thing ("busy right now", "call me later",
-                "not a good time", "maybe down the road") -> that's bad_timing.
-              - If it's a genuine no ("just don't need it", "we're all set",
-                "not for us") -> that's not_interested.
+              - If it's a timing thing -> that's bad_timing.
+              - If it's a genuine no -> that's not_interested.
             - If they agree to keep listening, that routes to a short pitch
               next — NOT straight to qualifying questions.
             """
@@ -443,7 +514,7 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
                     # was there and disconnected.
                     self._hello_phase_active = False
                     if not self.done():
-                        self.complete('hung_up')
+                        self._finish_task('hung_up')
                     return
             finally:
                 self.session.off("user_state_changed", _on_user_state)
@@ -474,7 +545,7 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
             print(f"[OpenerTask] task_complete('{result}') ignored — task already complete")
             return "Call already completed."
         if result == 'gatekeeper_referral':
-            self.complete({'result': result, 'referral_details': referral_details})
+            self._finish_task({'result': result, 'referral_details': referral_details})
             return
         if result == 'wrong_number':
             # Tool execution runs concurrently with (and finishes far faster
@@ -488,13 +559,13 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
             # tool call the SDK already awaits before treating this turn as
             # done — is what actually guarantees ordering, not the prompt.
             await self.session.generate_reply(
-                instructions='Apologize briefly for the mix-up — e.g. '
-                '"Oh — sorry about that, my mistake." One short sentence, '
-                'then stop.',
+                instructions='Apologize briefly for the mix-up and add a warm '
+                'sign-off — e.g. "Oh — sorry about that, my mistake. Have a '
+                'good day." Keep it short, then stop.',
                 allow_interruptions=False,
             )
         if not self.done():
-            self.complete(result)
+            self._finish_task(result)
 
 
 # ============================================================
@@ -541,18 +612,23 @@ class PitchTask(SpeechSafetyMixin, AgentTask):
               business, not a random rep in a queue."
 
             SCRIPT (use this closely, do not write your own version):
-            "So — we're Porter Capital... we help businesses like yours get
-             paid faster on outstanding invoices, instead of waiting weeks
-             or months. We've actually been doing this for decades — funded
-             billions to businesses out there. And unlike a lot of places,
-             you'd get a real person who can make a decision fast, not stuck
-             waiting on some committee. Does that sound worth a quick chat?"
+            "So — Porter Capital here. Basically, we help businesses get
+             working capital — cash against their unpaid invoices, instead
+             of waiting to get paid. We've actually been doing this for
+             decades — funded billions to businesses out there. Worth a
+             quick chat?"
 
-            The closing line is always some version of "does that sound
-            worth a quick chat?" — a soft check-in, never "what's your
-            current process for X" or any other fact-finding question.
-            Ending the pitch on a qualifying-style question is a rule
-            violation, not an acceptable variation.
+            The closing line is always some version of "worth a quick
+            chat?" — a soft check-in, never "what's your current process
+            for X" or any other fact-finding question. Ending the pitch on
+            a qualifying-style question is a rule violation, not an
+            acceptable variation.
+
+            If asked how fast funding happens: "Once you're set up with us,
+            we move fast — usually under 48 hours from submitting an
+            invoice." This is the only funding-speed detail you may
+            give — never imply this applies to a brand-new prospect's
+            first-ever funding from this call.
 
             Pause markers in these examples are deliberate:
             - '...' = a natural breath, hesitation, or thinking moment
@@ -587,6 +663,20 @@ class PitchTask(SpeechSafetyMixin, AgentTask):
             interested. If they show resistance or an objection, finish by
             calling the tool with result set to objection and put what they
             said in objection_text.
+
+            If their response is unclear or doesn't clearly fit interested
+            or objection — a mumbled answer, something off-topic, or
+            anything you're not confident you understood correctly — do NOT
+            guess which branch it is and do NOT call task_complete yet. Ask
+            ONE brief clarifying question naturally, e.g. "Sorry, was that a
+            yes, or were you not so sure?", then follow whichever branch
+            their answer now clearly fits. If it's STILL unclear after that
+            one clarifying attempt, default to treating it as an objection —
+            call task_complete with result set to objection and
+            objection_text noting the response was unclear, rather than
+            forcing interested; it's safer to route to a human-guided
+            objection-handling conversation than assume interest that
+            wasn't really expressed, but never guess blindly.
             """
         )
 
@@ -599,9 +689,9 @@ class PitchTask(SpeechSafetyMixin, AgentTask):
     async def task_complete(self, result: str, objection_text: str = ""):
         """result: interested / objection. objection_text: what they said, if result is objection."""
         if result == "objection":
-            self.complete({"result": result, "objection_text": objection_text})
+            self._finish_task({"result": result, "objection_text": objection_text})
         else:
-            self.complete({"result": result, "objection_text": ""})
+            self._finish_task({"result": result, "objection_text": ""})
 
 
 # ============================================================
@@ -641,6 +731,82 @@ class QualifierTask(SpeechSafetyMixin, AgentTask):
             answer]. And do you guys currently factor any of your
             invoices, or handle that a different way?"
 
+            If their answer to either the business-type question or the
+            factoring question is unclear or doesn't clearly fit what
+            you're asking — a mumbled answer, something off-topic, or
+            anything you're not confident you understood correctly — do NOT
+            guess and do NOT call task_complete yet. Ask ONE brief
+            clarifying question naturally, then follow whichever branch
+            their answer now clearly fits. If it's STILL unclear after that
+            one clarifying attempt, stay in this task and keep asking
+            rather than guessing or completing the task — there's no
+            urgency to end the call here, so never guess blindly just to
+            move forward.
+
+            ALREADY FACTORING WITH SOMEONE ELSE:
+            This is NOT an automatic disqualifier — do not treat it as a
+            dead end. A prospect who already has a factor may still be
+            unhappy with them or open to switching, and there's a dedicated
+            objection script for exactly this. If they say they already
+            factor invoices with another company, call the task_complete
+            tool with result set to objection and objection_text set to
+            what they said — this hands off to the objection-handling flow
+            (the "we already have a factor" script), not an instant
+            not_qualified.
+            Reserve not_qualified for when business type or factoring
+            status genuinely rules them out for reasons OTHER than already
+            having a factor (e.g. wrong type of business, or a clear
+            negative signal unrelated to having an existing factor).
+
+            OFFERING A ROUGH FUNDING ESTIMATE (only after business type and
+            factoring status are established, and only for prospects who
+            are NOT being routed to objection handling):
+
+            Offer to give them a rough estimate — do not ask for their
+            numbers upfront. Example:
+            "I can actually give you a rough estimate of what we could get
+            you, if that'd help — want me to?"
+
+            If they say NO or decline:
+            Skip the estimate entirely. Move directly to offering to connect
+            them with a human advisor, same as usual.
+
+            If they say YES:
+            Ask for either their open accounts receivable (AR) balance or
+            their annual revenue — whichever feels more natural, don't ask
+            for both back to back.
+
+            If the number they give you is unclear or garbled — a mumbled
+            figure, or anything you're not confident you understood
+            correctly — do NOT guess the number. Ask ONE brief clarifying
+            question naturally, e.g. "Sorry, could you say that number
+            again?", then use whichever number they now clearly give you.
+            If it's STILL unclear after that one clarifying attempt, skip
+            the estimate entirely and move to offering the advisor
+            connection — same as if they'd said no to the estimate offer —
+            rather than guessing at a number.
+
+            Once you have ONE of these numbers, calculate a rough estimate:
+            - If given an AR balance: estimate = that number x 90%
+            - If given annual revenue: estimate = that number x 10%
+            - If given both: use either one, your choice
+
+            State this as a rough, non-binding estimate — always immediately
+            followed by an offer to connect them with a human advisor for
+            exact numbers. Example phrasing:
+            "Based on that, we could likely get you up to around [estimate]
+            — but the exact number really depends on the details, so let's
+            get you connected with one of our advisors who can nail that
+            down for you. Sound good?"
+
+            NEVER present this estimate as a guaranteed or final number —
+            it is always a rough approximation, and the human advisor
+            always provides the real figure.
+
+            If they agree to connect with an advisor (whether or not they
+            took the estimate), move to booking — get their best day/time
+            for a callback, same as the existing "open to exploring" flow.
+
             OFF-SCRIPT QUESTIONS (process, eligibility, rates):
             An engaged prospect asking questions about the process,
             eligibility, or rates is NOT a disqualifying signal — it's
@@ -648,9 +814,10 @@ class QualifierTask(SpeechSafetyMixin, AgentTask):
             specifics to the human advisor, then return to qualifying or
             move toward booking if they seem ready. Do NOT call
             task_complete just because the conversation went off-script —
-            only call it once you've actually determined qualified or
-            not_qualified based on business type and factoring status (or
-            a clear negative signal from the prospect).
+            only call it once you've actually determined qualified,
+            not_qualified, or objection (see ALREADY FACTORING above) based
+            on business type and factoring status (or a clear negative
+            signal from the prospect).
 
             Pause markers in these examples are deliberate:
             - '...' = a natural breath, hesitation, or thinking moment
@@ -678,10 +845,18 @@ class QualifierTask(SpeechSafetyMixin, AgentTask):
             - Never say the PROSPECT'S/LEAD'S company name back to them — it's
               internal context only, never spoken aloud. (Porter Capital,
               Aiva's own employer, is separate and fine to say if relevant.)
-            - NEVER quote rates, percentages, or dollar amounts
-            - If asked about rates, say only:
-              "Honestly it depends on your volume — our advisor
-               gets you an exact number in 15 minutes."
+            - NEVER quote rates, percentages, or dollar amounts EXCEPT the
+              rough funding estimate above, which is the one sanctioned
+              exception, and must always be framed as non-binding.
+            - If asked about rates specifically (not the funding estimate),
+              say only:
+              "Honestly, it depends on a few things — how much you're
+               invoicing, your customers, stuff like that. Rates typically
+               run somewhere between 0.2 and 2 percent... but we'd build you
+               an actual number once we know more."
+            - If asked how fast funding happens: "Once you're set up with
+              us, we move fast — usually under 48 hours from submitting an
+              invoice."
             - One question at a time. Always.
 
             Use this knowledge to answer questions accurately:
@@ -700,9 +875,14 @@ class QualifierTask(SpeechSafetyMixin, AgentTask):
         )
 
     @function_tool()
-    async def task_complete(self, result: str):
-        """result: qualified / not_qualified"""
-        self.complete(result)
+    async def task_complete(self, result: str, objection_text: str = ""):
+        """result: qualified / not_qualified / objection.
+        objection_text: what they said, only when result is objection
+        (e.g. they already factor invoices with someone else)."""
+        if result == "objection":
+            self._finish_task({"result": result, "objection_text": objection_text})
+        else:
+            self._finish_task({"result": result, "objection_text": ""})
 
 
 # ============================================================
@@ -730,8 +910,8 @@ class ObjectionTask(SpeechSafetyMixin, AgentTask):
 
             Examples:
             "We already have a factor" ->
-            "That makes sense... most people do. Just curious though — are
-             you totally happy with what you're getting from them?"
+            "That makes sense... most people do. Worth a quick look to see
+             if we could actually do better for you?"
 
             "Not interested" ->
             "Totally fair. Can I ask real quick — is it bad timing, or just
@@ -740,14 +920,32 @@ class ObjectionTask(SpeechSafetyMixin, AgentTask):
             result you pass:
             - If it's a timing thing ("busy right now", "call me later",
               "not a good time", "maybe down the road") -> that's bad_timing.
+              Once you know it's a timing thing, ask: "No worries — when
+              would be a better time for us to check back in?" and note
+              whatever they say (e.g. "next month", "in two weeks") so it
+              can be passed along.
             - If it's a genuine no ("just don't need it", "we're all set",
               "not for us") -> that's not_interested.
 
+            If their answer to "is it bad timing, or just not something you
+            need right now?" is unclear or doesn't clearly fit either
+            option — do NOT guess and do NOT call task_complete yet. Ask
+            ONE brief clarifying rephrase naturally, then follow whichever
+            result their answer now clearly fits. If it's STILL unclear
+            after that one clarifying attempt, default to not_interested —
+            conservative, since you shouldn't assume a callback was wanted
+            if it wasn't clearly stated — but still end warmly, same as the
+            existing not_interested pattern, rather than guessing blindly.
+
             "What are your rates" ->
             "Honestly, it depends on a few things — how much you're
-             invoicing, your customers, stuff like that. Most places run
-             somewhere between 1 and 5 percent... but we'd build you an
-             actual number once we know more."
+             invoicing, your customers, stuff like that. Rates typically
+             run somewhere between 0.2 and 2 percent... but we'd build you
+             an actual number once we know more."
+
+            "How fast could I get funded" ->
+            "Once you're set up with us, we move fast — usually under 48
+             hours from submitting an invoice."
 
             Pause markers in these examples are deliberate:
             - '...' = a natural breath, hesitation, or thinking moment
@@ -765,7 +963,9 @@ class ObjectionTask(SpeechSafetyMixin, AgentTask):
               Aiva's own employer, is separate and fine to say if relevant.)
             - ONE response then stop. Never push twice.
             - If they say no again, accept it gracefully and warmly.
-            - NEVER quote rates or percentages. Ever.
+            - NEVER quote a specific rate or percentage beyond the approved
+              0.2-to-2-percent range shown in the script above. Never give a
+              number more precise than that range.
             - Then call the task_complete tool — do not write it out as
               text. Speak only your acknowledgment and question; the tool
               call itself is a separate, silent action, never part of
@@ -781,7 +981,7 @@ class ObjectionTask(SpeechSafetyMixin, AgentTask):
     @function_tool()
     async def task_complete(self, result: str):
         """result: still_interested / not_interested / bad_timing / wants_callback"""
-        self.complete(result)
+        self._finish_task(result)
 
 
 # ============================================================
@@ -826,6 +1026,23 @@ class BookingTask(SpeechSafetyMixin, AgentTask):
                (may differ from the one you called)
             2. Best day and time for a 15-minute call
 
+            If asked about rates: "Honestly, it depends on a few things —
+            how much you're invoicing, your customers, stuff like that.
+            Rates typically run somewhere between 0.2 and 2 percent... but
+            we'd build you an actual number once we know more."
+
+            If asked how fast funding happens: "Once you're set up with us,
+            we move fast — usually under 48 hours from submitting an
+            invoice."
+
+            If anything they say is unclear or doesn't obviously fit what
+            you're asking for (a garbled number, an ambiguous day/time, or
+            anything you're not confident you understood correctly) — do
+            NOT guess or make something up. Ask ONE brief clarifying
+            question naturally, e.g. "Sorry, could you say that number
+            again?" or "Just to confirm, did you mean [X]?" Never proceed
+            with uncertain details.
+
             Confirm back naturally, then call the task_complete tool — do
             not write it out as text. Speak only your natural confirmation;
             the tool call itself is a separate, silent action, never part
@@ -835,7 +1052,8 @@ class BookingTask(SpeechSafetyMixin, AgentTask):
             - Never say the PROSPECT'S/LEAD'S company name back to them — it's
               internal context only, never spoken aloud. (Porter Capital,
               Aiva's own employer, is separate and fine to say if relevant.)
-            - Never quote rates or promise approval
+            - Never quote rates beyond the approved 0.2-to-2-percent range,
+              and never promise approval
             - Keep it warm and brief — they already said yes
             """.replace("{NATURAL_SPEECH_GUIDE}", NATURAL_SPEECH_GUIDE)
         )
@@ -848,7 +1066,7 @@ class BookingTask(SpeechSafetyMixin, AgentTask):
     @function_tool()
     async def task_complete(self, callback_details: str):
         """Call when callback details are confirmed."""
-        self.complete(f"booked:{callback_details}")
+        self._finish_task(f"booked:{callback_details}")
 
 
 # ============================================================
@@ -870,9 +1088,8 @@ class DisclosureTask(SpeechSafetyMixin, AgentTask):
             {NATURAL_SPEECH_GUIDE}
 
             Answer like this — make it your own version:
-            "Yeah, I am — an AI, just being real about it. Happy to keep
-             chatting, or if you'd rather talk to one of our humans, I can
-             set that up too."
+            "I am, yeah... happy to keep going, or I can grab you one of
+             our advisors if you'd rather talk to an actual person."
 
             Pause markers in these examples are deliberate:
             - '...' = a natural breath, hesitation, or thinking moment
@@ -888,6 +1105,15 @@ class DisclosureTask(SpeechSafetyMixin, AgentTask):
               Aiva's own employer, is separate and fine to say if relevant.)
             - Sound unbothered and warm about being an AI
             - Do not apologize for being an AI
+            - If their reaction is unclear or doesn't clearly fit accepted,
+              wants_human, or wants_to_end — a mumbled answer, something
+              off-topic, or anything you're not confident you understood
+              correctly — do NOT guess and do NOT call task_complete yet.
+              Ask ONE brief clarifying check-in naturally, e.g. "Are you
+              good to keep chatting?", then follow whichever branch their
+              answer now clearly fits. If it's STILL unclear after that one
+              clarifying attempt, default to accepted — assume they're fine
+              continuing — rather than guessing blindly.
             - Then call the task_complete tool — do not write it out as
               text. Speak only your natural reply; the tool call itself is
               a separate, silent action, never part of what you say out
@@ -903,7 +1129,7 @@ class DisclosureTask(SpeechSafetyMixin, AgentTask):
     @function_tool()
     async def task_complete(self, prospect_reaction: str):
         """result: accepted / wants_human / wants_to_end"""
-        self.complete(prospect_reaction)
+        self._finish_task(prospect_reaction)
 
 
 # ============================================================
@@ -962,12 +1188,19 @@ class ExitTask(SpeechSafetyMixin, AgentTask):
     @function_tool()
     async def task_complete(self):
         """Call immediately after acknowledging opt-out."""
-        add_to_suppression(
-            company_name   = self.lead.get('company_name', ''),
-            website_domain = self.lead.get('website_domain', ''),
-            reason         = 'opted_out'
-        )
-        self.complete('suppressed')
+        if os.getenv("TEST_MODE", "false").lower() == "true":
+            print(
+                "TEST MODE — suppression_list NOT updated. Would have added: "
+                f"company_name={self.lead.get('company_name', '')!r} "
+                f"website_domain={self.lead.get('website_domain', '')!r} reason='opted_out'"
+            )
+        else:
+            add_to_suppression(
+                company_name   = self.lead.get('company_name', ''),
+                website_domain = self.lead.get('website_domain', ''),
+                reason         = 'opted_out'
+            )
+        self._finish_task('suppressed')
 
 
 # ============================================================
@@ -981,6 +1214,15 @@ class PorterSupervisor(SpeechSafetyMixin, Agent):
         self.ctx         = ctx
         self.call_result = 'no_answer'
 
+        # Persisted alongside call_result at call-end (see when_call_starts).
+        # objection_text holds only the MOST RECENT objection — a call can
+        # pass through run_objection more than once, but the last one is the
+        # most relevant context for a human advisor reviewing the lead, and
+        # overwriting is simpler than concatenating a history.
+        self.referral_details = None
+        self.callback_details = None
+        self.objection_text   = None
+
         company  = lead.get('company_name', 'the company')
         city     = lead.get('city', '')
         state    = lead.get('state', '')
@@ -992,7 +1234,8 @@ class PorterSupervisor(SpeechSafetyMixin, Agent):
             Porter Capital sales call. Agent: Aiva (AI).
             Lead: {company}, {city} {state}, {industry}, Tier: {tier}
 
-            ABSOLUTE RULE: NEVER quote rates or numbers. Ever.
+            ABSOLUTE RULE: NEVER quote rates or numbers except QualifierTask's
+            explicitly sanctioned rough, non-binding funding estimate.
             If asked about rates say only:
             "Honestly it depends on your volume —
             our advisor gets you an exact number in 15 minutes.
@@ -1063,14 +1306,15 @@ class PorterSupervisor(SpeechSafetyMixin, Agent):
         """Call this first at the start of every call."""
         result = await OpenerTask(self.lead)
         if isinstance(result, dict) and result.get('result') == 'gatekeeper_referral':
-            # Not a sales decision — a routing dead end. There's no DB
-            # column for referral details today, so they're logged to
-            # console/call notes only; call_result falls back to
-            # 'contacted' (real contact was made, just not with a decision
-            # maker) rather than inventing a new status literal db.py's
-            # update_lead_status() doesn't accept.
+            # Not a sales decision — a routing dead end. call_result falls
+            # back to 'contacted' (real contact was made, just not with a
+            # decision maker) rather than inventing a new status literal
+            # db.py's update_lead_status() doesn't accept. referral_details
+            # itself is persisted to its own column at call-end (see
+            # when_call_starts) so a human advisor can actually act on it.
             referral_details = result.get('referral_details', '')
             print(f"[Gatekeeper referral] {self.lead.get('company_name', 'lead')}: {referral_details}")
+            self.referral_details = referral_details
             self.call_result = 'contacted'
             await self._end_call(
                 "Acknowledge warmly, thank them for the info, and end the "
@@ -1136,6 +1380,7 @@ class PorterSupervisor(SpeechSafetyMixin, Agent):
     @function_tool()
     async def run_objection(self, objection: str):
         """Prospect raised objection or pushback, from any point in the call. objection = what they said."""
+        self.objection_text = objection
         result = await ObjectionTask(objection)
         if result == 'not_interested':
             self.call_result = 'not_interested'
@@ -1156,8 +1401,13 @@ class PorterSupervisor(SpeechSafetyMixin, Agent):
     async def run_qualifier(self):
         """Pitch has already been accepted. Qualify the prospect."""
         result = await QualifierTask(self.lead)
-        if result == 'qualified':
+        if result['result'] == 'qualified':
             return "Qualified. Move toward booking."
+        if result['result'] == 'objection':
+            # e.g. "we already have a factor" — a switchable objection, not
+            # an automatic disqualifier. Route to the same objection-handling
+            # flow run_pitch uses, rather than hanging up.
+            return await self.run_objection(result['objection_text'])
         self.call_result = 'not_interested'
         await self._end_call(
             "Acknowledge warmly, thank them for their time, and end the call in one short sentence."
@@ -1170,6 +1420,7 @@ class PorterSupervisor(SpeechSafetyMixin, Agent):
         result = await BookingTask()
         self.call_result = 'callback_booked'
         callback_details = result.split("booked:", 1)[1] if result.startswith("booked:") else result
+        self.callback_details = callback_details
         await self._end_call(
             "Confirm warmly that they're all set, referencing these callback details "
             f"naturally: {callback_details}. Say one of our advisors will call them then. "
@@ -1202,6 +1453,19 @@ OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 def _build_llm(provider: str):
     if provider == "groq":
         return groq.LLM(model="llama-3.3-70b-versatile", timeout=10.0)
+    elif provider == "grok":
+        grok_model = os.getenv("GROK_MODEL", "xai/grok-4-1-fast-non-reasoning")
+        xai_key = os.getenv("XAI_API_KEY")
+        if xai_key:
+            # Talk to xAI directly, bypassing LiveKit Inference.
+            return openai_plugin.LLM(
+                model=grok_model.removeprefix("xai/"),
+                api_key=xai_key,
+                base_url="https://api.x.ai/v1",
+                timeout=10.0,
+            )
+        # Default: LiveKit Inference gateway, authenticated via LIVEKIT_API_KEY/SECRET.
+        return inference.LLM(model=grok_model)
     elif provider == "claude":
         return anthropic.LLM(model="claude-haiku-4-5")
     elif provider == "gpt":
@@ -1358,6 +1622,15 @@ async def when_call_starts(ctx: JobContext):
     current_lead = lead
     print(f"Calling: {lead['company_name']} | Tier: {lead['tier']}")
 
+    call_id = await asyncio.to_thread(
+        create_call,
+        lead["lead_candidate_id"],
+        "v1",
+        os.getenv("LLM_PROVIDER", "groq").lower(),
+        os.getenv("TTS_PROVIDER", "cartesia").lower(),
+        ctx.job.room.sid or ctx.room.sid or ctx.room.name,
+    )
+
     pipeline = AgentSession(
         stt = deepgram.STT(model="nova-2"),
         llm = get_llm(),
@@ -1366,6 +1639,30 @@ async def when_call_starts(ctx: JobContext):
     )
 
     supervisor = PorterSupervisor(lead, ctx)
+
+    task_names = {
+        "OpenerTask": "opener",
+        "PitchTask": "pitch",
+        "QualifierTask": "qualifier",
+        "ObjectionTask": "objection",
+        "BookingTask": "booking",
+        "DisclosureTask": "disclosure",
+        "ExitTask": "exit",
+        "PorterSupervisor": "supervisor",
+    }
+
+    def _active_task():
+        current_agent = pipeline.current_agent
+        return task_names.get(
+            type(current_agent).__name__,
+            type(current_agent).__name__,
+        )
+
+    transcript = CallTranscriptRecorder(call_id, _active_task)
+    pipeline.on(
+        "conversation_item_added",
+        transcript.on_conversation_item_added,
+    )
 
     # generate_reply() only dispatches the current turn — it returns long
     # before the AgentTask chain (opener -> qualifier/objection/booking/exit)
@@ -1393,36 +1690,47 @@ async def when_call_starts(ctx: JobContext):
 
     pipeline.on("error", _on_agent_error)
 
-    await pipeline.start(
-        room               = ctx.room,
-        agent              = supervisor,
-        room_input_options = RoomInputOptions(),
-    )
+    try:
+        await pipeline.start(
+            room               = ctx.room,
+            agent              = supervisor,
+            room_input_options = RoomInputOptions(),
+        )
 
-    # Must go through generate_reply()/tool-calling, NOT a direct
-    # `await supervisor.start_call()` — AgentTask.__await_impl() (see
-    # livekit.agents.voice.agent.py) requires the awaiting asyncio.Task to be
-    # tagged inline_task=True, and that tag is only ever set on two kinds of
-    # task: the SDK's own tool-function dispatch task, and the on_enter/
-    # on_exit task created by AgentActivity.start(). when_call_starts's task
-    # is neither, so a direct call makes OpenerTask's internal
-    # `await OpenerTask(...)` raise RuntimeError. Going through
-    # generate_reply() lets the LLM invoke start_call as a real tool call,
-    # which runs inside the SDK's inline-tagged dispatch task. The
-    # wait-for-their-hello-or-timeout race still happens correctly once
-    # inside OpenerTask.on_enter() — that context was never the problem.
-    await pipeline.generate_reply(
-        instructions="Call just connected. Call start_call now. Nothing else."
-    )
+        # Must go through generate_reply()/tool-calling, NOT a direct
+        # `await supervisor.start_call()` — AgentTask.__await_impl() (see
+        # livekit.agents.voice.agent.py) requires the awaiting asyncio.Task to be
+        # tagged inline_task=True, and that tag is only ever set on two kinds of
+        # task: the SDK's own tool-function dispatch task, and the on_enter/
+        # on_exit task created by AgentActivity.start(). when_call_starts's task
+        # is neither, so a direct call makes OpenerTask's internal
+        # `await OpenerTask(...)` raise RuntimeError. Going through
+        # generate_reply() lets the LLM invoke start_call as a real tool call,
+        # which runs inside the SDK's inline-tagged dispatch task. The
+        # wait-for-their-hello-or-timeout race still happens correctly once
+        # inside OpenerTask.on_enter() — that context was never the problem.
+        await pipeline.generate_reply(
+            instructions="Call just connected. Call start_call now. Nothing else."
+        )
 
-    await call_ended.wait()
+        await call_ended.wait()
+    finally:
+        await transcript.close(supervisor.call_result)
 
     if os.getenv("TEST_MODE", "false").lower() == "true":
-        print(f"TEST MODE — lead status NOT updated. Would have set: {supervisor.call_result}")
+        print(
+            f"TEST MODE — lead status NOT updated. Would have set: {supervisor.call_result} | "
+            f"referral_details={supervisor.referral_details!r} | "
+            f"callback_details={supervisor.callback_details!r} | "
+            f"objection_text={supervisor.objection_text!r}"
+        )
     else:
         update_lead_status(
             lead_candidate_id = lead['lead_candidate_id'],
-            new_status        = supervisor.call_result
+            new_status        = supervisor.call_result,
+            referral_details  = supervisor.referral_details,
+            callback_details  = supervisor.callback_details,
+            objection_text    = supervisor.objection_text,
         )
 
     print(f"Call ended. Result: {supervisor.call_result}")

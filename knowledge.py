@@ -24,15 +24,15 @@ who'd actually know that off the top of their head."
 
 RATES
 "Yeah so honestly it depends — how much you're invoicing, who
-your customers are, stuff like that. Most places run somewhere
-between 1 and 5 percent, but we'd build you an actual number
+your customers are, stuff like that. Rates typically run somewhere
+between 0.2 and 2 percent, but we'd build you an actual number
 once we know more."
 
-Never a specific number beyond the 1-5% range.
+Never a specific number beyond the 0.2-2% range.
 
 FUNDING SPEED
-"Once you're set up with us it's pretty quick, like 24 to 48
-hours after you send an invoice over."
+"Once you're set up with us, we move fast — usually under 48
+hours from submitting an invoice."
 
 FEES
 "That kind of depends on how things get structured for you —

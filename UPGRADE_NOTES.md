@@ -48,6 +48,24 @@ is available.
   the upstream fix ships in a released livekit-agents version (see TODO
   above), this caveat goes away entirely regardless of testing mode.
 
+## No full call transcript persistence (known gap, deferred)
+- Confirmed 2026-07-15: neither agent.py nor agent_v2.py persists a full
+  call transcript anywhere. The conversation only exists as live STT/LLM/
+  TTS turns inside the LiveKit pipeline process and whatever hits stdout
+  via `print()` — nothing is written to a file or the database. Once the
+  process/terminal ends, the transcript is gone permanently.
+- What IS persisted today: `lead_candidates.sales_status`/`updated_at`/
+  `recontact_at` (via `update_lead_status()`), plus the three call-notes
+  columns added by `migrate_add_call_notes_columns.py`
+  (`referral_details`, `callback_details`, `objection_text` — each holds
+  only the single most recent value, not a transcript).
+- NOT built: a dedicated `calls`/`transcript` table keyed by
+  `lead_candidate_id` (one row per call, holding the full turn-by-turn
+  transcript) would be needed for real call auditing/compliance — e.g.
+  proving what was actually said on a given call, not just the summarized
+  outcome fields. Intentionally deferred as a separate follow-up, not
+  forgotten.
+
 ## OpenerTask hello-loop: VAD echo false positive (fixed 2026-07-14)
 - Bug: `on_enter`'s hello-escalation loop (agent.py `OpenerTask.on_enter`)
   could silently exit after attempt 0 — no attempt 2/3, no timeout hangup,

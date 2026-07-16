@@ -41,6 +41,59 @@ def get_connection():
     return psycopg2.connect(**DB_CONFIG)
 
 
+def create_call(lead_candidate_id, agent_version, llm_provider,
+                tts_provider, room_id):
+    """Create a call record and return its database ID."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO calls (
+                    lead_candidate_id,
+                    call_started_at,
+                    agent_version,
+                    llm_provider,
+                    tts_provider,
+                    room_id
+                )
+                VALUES (%s, now(), %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                lead_candidate_id,
+                agent_version,
+                llm_provider,
+                tts_provider,
+                room_id,
+            ))
+            return cursor.fetchone()[0]
+
+
+def add_call_turn(call_id, turn_number, role, text, task_or_stage):
+    """Persist one ordered user or assistant transcript turn."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO call_turns (
+                    call_id,
+                    turn_number,
+                    role,
+                    text,
+                    task_or_stage
+                )
+                VALUES (%s, %s, %s, %s, %s)
+            """, (call_id, turn_number, role, text, task_or_stage))
+
+
+def finish_call(call_id, final_call_result):
+    """Mark a call complete with the same result used for the lead."""
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                UPDATE calls
+                SET call_ended_at = now(), final_call_result = %s
+                WHERE id = %s
+            """, (final_call_result, call_id))
+
+
 def get_next_lead():
     """
     Finds the single best lead to call right now.
@@ -76,7 +129,8 @@ def get_next_lead():
             lc.id                   AS lead_candidate_id,
             lc.tier,
             lc.current_score,
-            lc.why_now_summary
+            lc.why_now_summary,
+            lc.contact_name
         FROM lead_candidates lc
 
         -- Join to get company details (name, location, industry)
@@ -154,10 +208,12 @@ def get_next_lead():
         "tier":              row[8],
         "current_score":     row[9],
         "why_now_summary":   row[10],
+        "contact_name":      row[11],
     }
 
 
-def update_lead_status(lead_candidate_id, new_status):
+def update_lead_status(lead_candidate_id, new_status, referral_details=None,
+                        callback_details=None, objection_text=None):
     """
     After a call ends, write the outcome back to the database.
     This keeps your Lead Intelligence system up to date.
@@ -172,31 +228,43 @@ def update_lead_status(lead_candidate_id, new_status):
     - 'suppressed'      → they asked to be removed from our list
     - 'no_answer'       → nobody picked up
     - 'sector_excluded' → turned out to be wrong industry mid-call
+
+    referral_details / callback_details / objection_text: optional free-text
+    columns (see migrate_add_call_notes_columns.py). Only written when
+    provided (non-None) — omitting one never nulls out a value written by a
+    previous call.
     """
 
     conn   = get_connection()
     cursor = conn.cursor()
 
+    set_clauses = ["sales_status = %s", "updated_at = now()"]
+    params      = [new_status]
+
     if new_status == 'callback_later':
         # recontact_at added via migrate_add_recontact_at.py. The interval is
         # a placeholder (RECONTACT_DEFAULT_DAYS, default 7) pending a real
         # business decision on cadence — see db.py's RECONTACT_DEFAULT_DAYS.
-        cursor.execute("""
-            UPDATE lead_candidates
-            SET
-                sales_status = %s,
-                recontact_at = now() + (%s || ' days')::interval,
-                updated_at   = now()
-            WHERE id = %s
-        """, (new_status, RECONTACT_DEFAULT_DAYS, lead_candidate_id))
-    else:
-        cursor.execute("""
-            UPDATE lead_candidates
-            SET
-                sales_status = %s,
-                updated_at   = now()
-            WHERE id = %s
-        """, (new_status, lead_candidate_id))
+        set_clauses.append("recontact_at = now() + (%s || ' days')::interval")
+        params.append(RECONTACT_DEFAULT_DAYS)
+
+    if referral_details is not None:
+        set_clauses.append("referral_details = %s")
+        params.append(referral_details)
+    if callback_details is not None:
+        set_clauses.append("callback_details = %s")
+        params.append(callback_details)
+    if objection_text is not None:
+        set_clauses.append("objection_text = %s")
+        params.append(objection_text)
+
+    params.append(lead_candidate_id)
+
+    cursor.execute(f"""
+        UPDATE lead_candidates
+        SET {', '.join(set_clauses)}
+        WHERE id = %s
+    """, params)
 
     conn.commit()
     cursor.close()
