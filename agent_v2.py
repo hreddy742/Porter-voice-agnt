@@ -32,9 +32,9 @@ from livekit.agents import (
     function_tool,
     JobContext,
 )
-from livekit.agents.llm import FallbackAdapter
+from livekit.agents.llm import FallbackAdapter, ChatMessage, ChatChunk, ChoiceDelta
 from livekit.agents import inference
-from livekit.plugins import groq, cartesia, deepgram, silero, anthropic, openai as openai_plugin, elevenlabs
+from livekit.plugins import groq, cartesia, deepgram, silero, openai as openai_plugin, elevenlabs
 from db import create_call, get_next_lead, update_lead_status, add_to_suppression
 from call_transcript import CallTranscriptRecorder
 from knowledge import PORTER_CAPITAL_KNOWLEDGE
@@ -94,7 +94,7 @@ The most important rules:
    - Use em-dashes for a small break in thought
      Example: "We work with — pretty much any B2B business."
    - Occasionally trail off naturally instead of finishing formally
-     Example: "Rates run about 0.2 to 2 percent, but yeah — depends
+     Example: "Rates run about 0.5 to 3 percent, but yeah — depends
      on the specifics."
    - Break up long sentences into two shorter ones with a pause
      between them rather than one long flowing sentence
@@ -102,6 +102,18 @@ The most important rules:
    - A slight, natural stumble occasionally reads as more human than
      a perfectly smooth sentence: "We — we can definitely look into
      that for you."
+"""
+
+KNOWLEDGE_DEFER_RULE = """
+ANSWER WHAT YOU KNOW, DEFER ONLY WHAT YOU DON'T:
+Answer directly and confidently anything covered by your knowledge base or
+this task's script — never defer something you actually know. If a question
+(or part of a multi-part question) touches a specific fact, number, or stat
+you don't actually have in your knowledge — answer whichever parts you DO
+know directly, and for the specific unknown part only, say something like
+"That exact number I'd have to check with our team, but I can tell you
+[the part you do know]" — never invent a specific number or fact you don't
+have, even for just one piece of a larger question.
 """
 
 
@@ -129,17 +141,125 @@ def strip_leaked_meta_text(text: str) -> str:
     return text.strip()
 
 
+# RATE-GUARDRAIL — TWO sanctioned ranges, told apart by context:
+#   FEE     (what Porter charges, monthly, on outstanding invoices): 0.5-3%
+#   ADVANCE (% of invoice value paid upfront):                       80-95%
+# For either range, only the range itself — never a single confident
+# number — is sanctioned dialogue. Context is decided by scanning a window
+# of text around each matched number for keyword cues (_FEE_CONTEXT /
+# _ADVANCE_CONTEXT below): "rate"/"fee"/"charge"/"percent...depends" mark a
+# FEE mention, "advance"/"upfront"/"of your invoice" mark an ADVANCE
+# mention. A number that can't be pinned to exactly one context (both cue
+# sets hit, or neither) is treated conservatively as a violation — never
+# guessed into whichever range happens to contain the value. Dollar figures
+# (funding estimates) never match: the regex requires a trailing % or
+# "percent".
+_FEE_RANGE = (0.5, 3.0)
+_ADVANCE_RANGE = (80.0, 95.0)
+
+_NUM = r'\d+(?:\.\d+)?'
+_RATE_RANGE = re.compile(rf'({_NUM})\s*(?:to|and|-|–|—)\s*({_NUM})\s*(?:%|percent\b)', re.IGNORECASE)
+_RATE_SINGLE = re.compile(rf'({_NUM})\s*(?:%|percent\b)', re.IGNORECASE)
+_RATE_HEDGE = re.compile(r'(?:around|about|approximately|roughly|somewhere\s+(?:around|between|near)|close\s+to)\s*$', re.IGNORECASE)
+
+# Context cues, checked in a window of text around each matched number.
+_FEE_CONTEXT = re.compile(r'\b(rate|rates|fee|fees|charge|charges|charging)\b', re.IGNORECASE)
+_FEE_CONTEXT_DEPENDS = re.compile(r'percent\b.{0,40}?\bdepends\b', re.IGNORECASE | re.DOTALL)
+_ADVANCE_CONTEXT = re.compile(r'\b(advance|advanced|advancing|upfront|up\s+front)\b|\bof\s+(?:your|the)\s+invoice\b', re.IGNORECASE)
+_CONTEXT_WINDOW = 80  # chars of surrounding text scanned for context cues
+
+RATE_FALLBACK_LINE = (
+    "Rates typically run somewhere between 0.5 and 3 percent — "
+    "I'll get you the exact number through one of our advisors."
+)
+ADVANCE_FALLBACK_LINE = (
+    "We typically advance somewhere between 80 and 95 percent of the "
+    "invoice value upfront — I'll get you the exact number through one "
+    "of our advisors."
+)
+
+
+def _classify_rate_context(text: str, start: int, end: int) -> str:
+    """Classify the number/range at text[start:end] as 'fee', 'advance', or
+    'unclear', based on keyword cues in a window of surrounding text."""
+    window = text[max(0, start - _CONTEXT_WINDOW): end + _CONTEXT_WINDOW]
+    is_fee = bool(_FEE_CONTEXT.search(window) or _FEE_CONTEXT_DEPENDS.search(window))
+    is_advance = bool(_ADVANCE_CONTEXT.search(window))
+    if is_fee and not is_advance:
+        return "fee"
+    if is_advance and not is_fee:
+        return "advance"
+    return "unclear"
+
+
+def find_rate_violation(text: str):
+    """Return (description, fallback_line) for the first out-of-policy rate
+    mention, or None. An unclassifiable context always counts as a
+    violation (conservative default) and uses the FEE fallback line, since
+    that's the older, more commonly triggered of the two rules."""
+    range_spans = []
+    for m in _RATE_RANGE.finditer(text):
+        range_spans.append((m.start(), m.end()))
+        low, high = float(m.group(1)), float(m.group(2))
+        context = _classify_rate_context(text, m.start(), m.end())
+        if context == "unclear":
+            return f"unclassifiable rate range '{m.group(0).strip()}'", RATE_FALLBACK_LINE
+        lo, hi = _FEE_RANGE if context == "fee" else _ADVANCE_RANGE
+        fallback = RATE_FALLBACK_LINE if context == "fee" else ADVANCE_FALLBACK_LINE
+        if not (lo <= low <= hi and lo <= high <= hi):
+            return f"out-of-range {context} range '{m.group(0).strip()}'", fallback
+
+    for m in _RATE_SINGLE.finditer(text):
+        if any(start <= m.start() < end for start, end in range_spans):
+            continue  # already covered as part of a range match above
+        value = float(m.group(1))
+        context = _classify_rate_context(text, m.start(), m.end())
+        if context == "unclear":
+            return f"unclassifiable rate '{m.group(0).strip()}'", RATE_FALLBACK_LINE
+        lo, hi = _FEE_RANGE if context == "fee" else _ADVANCE_RANGE
+        fallback = RATE_FALLBACK_LINE if context == "fee" else ADVANCE_FALLBACK_LINE
+        if not (lo <= value <= hi):
+            return f"out-of-range {context} rate '{m.group(0).strip()}'", fallback
+        if not _RATE_HEDGE.search(text[:m.start()]):
+            return f"unhedged firm {context} quote '{m.group(0).strip()}'", fallback
+
+    return None
+
+
 class SpeechSafetyMixin:
-    """Filters spoken output through strip_leaked_meta_text before synthesis."""
+    """Filters BOTH spoken audio and the text logged as the conversation-
+    history item through strip_leaked_meta_text + the rate guardrail.
+
+    tts_node (audio) and transcription_node (chat-history/transcript text)
+    each get their own independent tee'd copy of the same raw LLM text (see
+    AgentActivity._pipeline_reply_task_impl's `tee = itertools.tee(text, 2)`
+    in the livekit-agents SDK) — filtering only tts_node left
+    transcription_node's copy carrying the original, unfiltered text
+    straight into conversation_item_added and the persisted transcript, so
+    a detected rate violation was blocked from audio but still
+    logged/persisted verbatim. Both nodes now run the identical filter over
+    their own copy so the two always converge on the same final (possibly
+    substituted) text.
+    """
+
+    @staticmethod
+    async def _filtered_text(text):
+        full_text = "".join([chunk async for chunk in text])
+        cleaned = strip_leaked_meta_text(full_text)
+        if not cleaned:
+            return
+        violation = find_rate_violation(cleaned)
+        if violation:
+            description, fallback_line = violation
+            print(f"[RATE GUARDRAIL] blocked text ({description}): {cleaned!r}")
+            cleaned = fallback_line
+        yield cleaned
 
     async def tts_node(self, text, model_settings):
-        async def _filtered():
-            full_text = "".join([chunk async for chunk in text])
-            cleaned = strip_leaked_meta_text(full_text)
-            if cleaned:
-                yield cleaned
+        return Agent.default.tts_node(self, self._filtered_text(text), model_settings)
 
-        return Agent.default.tts_node(self, _filtered(), model_settings)
+    async def transcription_node(self, text, model_settings):
+        return Agent.default.transcription_node(self, self._filtered_text(text), model_settings)
 
 
 # ============================================================
@@ -148,6 +268,51 @@ class SpeechSafetyMixin:
 
 OPENER_WAIT_TIMEOUT_SECONDS = float(os.getenv("OPENER_WAIT_TIMEOUT_SECONDS", "3.5"))
 OPENER_MAX_HELLO_ATTEMPTS = int(os.getenv("OPENER_MAX_HELLO_ATTEMPTS", "3"))
+
+# GLOBAL SAFETY NETS — see _on_conversation_item_added() and
+# _require_confirmed_turn(). Two independent, model-agnostic backstops:
+# a total-real-user-turns ceiling (catches a call that never resolves even
+# if no *_result tool is ever blocked — e.g. the model just keeps talking
+# without calling any tool) and a whole-call violation ceiling that doesn't
+# reset on stage change (catches a model that evades the per-stage 3-strike
+# guard by hopping between stages before any single stage accumulates 3).
+#
+# GLOBAL_TURN_LIMIT=30: real transcript data (2026-07-17 testing) shows a
+# complete, healthy call — hello through booking, including the funding
+# estimate flow — runs roughly 14-16 turns naturally. 30 gives comfortable
+# buffer for a detailed conversation with extra questions or one objection,
+# while still catching a genuinely stuck/looping call well before it could
+# run indefinitely.
+GLOBAL_TURN_LIMIT = int(os.getenv("GLOBAL_TURN_LIMIT", "30"))
+WHOLE_CALL_VIOLATION_LIMIT = int(os.getenv("WHOLE_CALL_VIOLATION_LIMIT", "5"))
+
+# NO-TOOL DRIFT GUARD — see _on_conversation_item_added() and
+# _inject_drift_correction(). Catches PRODUCTIVE-seeming improvisation: the
+# model carries a plausible pitch/qualifying/booking-style conversation in
+# pure free text for several turns without ever attempting the current
+# stage's *_result tool, so none of that stage's real script, funding math,
+# or booking logic ever activates even though the conversation sounds
+# coherent (2026-07-20 live-call finding — stage stayed "opener" the whole
+# call). Orthogonal to WHOLE_CALL_VIOLATION_LIMIT above: that one only
+# counts a tool call that WAS attempted and rejected; this one only counts
+# turns where no tool call was attempted at all, so the two can never fire
+# on the same turn. 3 consecutive no-tool turns in one stage is enough to
+# catch drift while still allowing the 1-2 turn clarifying-question retries
+# stage instructions already permit.
+NO_TOOL_DRIFT_LIMIT = int(os.getenv("NO_TOOL_DRIFT_LIMIT", "3"))
+
+# _END_CALL CLOSING-LINE GUARD — prepended to every closing_instructions
+# passed to _end_call(). Without this, the model sometimes treats the
+# closing instruction as a suggestion and tacks on an off-script follow-up
+# question instead of ending the call. This makes "no next turn, no
+# question, say only this" explicit regardless of which LLM is active.
+_FINAL_LINE_PREFIX = (
+    "This is the last thing you say before the call ends — there is no "
+    "next turn, so do not ask any question and do not offer anything "
+    "further. Do not repeat your exact previous response word-for-word; "
+    "vary the phrasing if it's similar to something already said. Say "
+    "only the following, then stop: "
+)
 
 _HELLO_ATTEMPT_INSTRUCTIONS = [
     'Open the call now. Say exactly a brief, neutral "Hello?" — nothing '
@@ -192,6 +357,8 @@ def _opener_block(company: str, city: str, contact_name: str) -> str:
 
     {NATURAL_SPEECH_GUIDE}
 
+    {KNOWLEDGE_DEFER_RULE}
+
     YOUR ONLY JOB: Open this call like a real human phone rep would — confirm
     you've reached the right company/person FIRST, and only disclose the
     AI/cold-call framing and ask for time AFTER that's confirmed. Never do both
@@ -214,6 +381,13 @@ def _opener_block(company: str, city: str, contact_name: str) -> str:
       "Hey — I'm trying to reach {company}, is that who I've got?"
 
     Listen to their answer and branch:
+    - REPEAT/CLARIFY REQUEST (they're asking you to repeat, rephrase, or
+      clarify the question itself — e.g. "what?", "can you repeat that?",
+      "sorry, say that again?", "huh?") -> this is NOT an answer to classify.
+      Simply repeat or naturally rephrase the same question. Do NOT call
+      opener_result. Do NOT treat this as confirmation, denial, unclear, or
+      any other classification below — it's a request to hear the question
+      again, nothing more.
     - CONFIRMED (yes, this is {company}/{contact_name}, or anything affirming
       it) -> move to the RIGHT-PERSON CHECK below, in your next reply. Do not
       call opener_result yet.
@@ -230,6 +404,13 @@ def _opener_block(company: str, city: str, contact_name: str) -> str:
       name mismatch:
       "Ah — are you with {company} at all, or is this a different business?"
       This is TURN 1B. Listen to their answer and branch:
+      - REPEAT/CLARIFY REQUEST (they're asking you to repeat, rephrase, or
+        clarify the question itself — e.g. "what?", "can you repeat that?",
+        "sorry, say that again?", "huh?") -> this is NOT an answer to
+        classify. Simply repeat or naturally rephrase the same question. Do
+        NOT call opener_result. Do NOT treat this as confirmation, denial,
+        unclear, or any other classification below — it's a request to hear
+        the question again, nothing more.
       - They confirm they ARE with {company} after all -> this is NOT a
         wrong number. Move to the RIGHT-PERSON CHECK below, in your next reply,
         exactly as if they'd confirmed the first time. Do not call
@@ -273,6 +454,13 @@ def _opener_block(company: str, city: str, contact_name: str) -> str:
      right person for that, or is there someone else who handles it?"
 
     Listen to their answer and branch:
+    - REPEAT/CLARIFY REQUEST (they're asking you to repeat, rephrase, or
+      clarify the question itself — e.g. "what?", "can you repeat that?",
+      "sorry, say that again?", "huh?") -> this is NOT an answer to classify.
+      Simply repeat or naturally rephrase the same question. Do NOT call
+      opener_result. Do NOT treat this as confirmation, denial, unclear, or
+      any other classification below — it's a request to hear the question
+      again, nothing more.
     - CONFIRMS they ARE the right person (e.g. "yes, that's me," "I handle
       that," or any other affirming answer) -> move to TURN 2 below, in your
       next reply. Do not call opener_result yet.
@@ -282,16 +470,18 @@ def _opener_block(company: str, city: str, contact_name: str) -> str:
       Listen to their answer and branch:
       - They provide a name and/or a way to reach that person (phone number,
         email, extension, department, or something like "just call back and
-        ask for accounting") -> acknowledge warmly and thank them for the info
-        in one short line — e.g. "Got it, thanks so much — have a great day!"
-        — then call opener_result with result set to gatekeeper_referral and
-        referral_details set to exactly what they told you (the name/contact
-        info/department, verbatim or close to it). This referral info gets
-        logged for a human advisor to follow up on directly.
+        ask for accounting") -> call opener_result now with result set to
+        gatekeeper_referral and referral_details set to exactly what they
+        told you (the name/contact info/department, verbatim or close to
+        it), and do not speak anything yourself in this turn — no thanks,
+        no sign-off, no other words. opener_result speaks the acknowledgment
+        and sign-off itself, in a separate, guaranteed step. This referral
+        info gets logged for a human advisor to follow up on directly.
       - They don't know who the right person is, or say no one else is
-        available or relevant -> acknowledge warmly with a closing line
-        yourself — e.g. "No worries at all, thanks for your time — have a good
-        one!" — THEN call opener_result with result set to not_interested.
+        available or relevant -> call opener_result now with result set to
+        not_interested, and do not speak anything yourself in this turn —
+        no sign-off, no other words. opener_result speaks the closing line
+        itself, in a separate, guaranteed step.
       This is a routing dead end, not a sales objection — there is no
       bad_timing distinction here, only whether they gave you a referral or
       not.
@@ -334,6 +524,13 @@ def _opener_block(company: str, city: str, contact_name: str) -> str:
       sign-off (e.g. "have a good day," "take care," "thanks so much") before
       the call ends. No silent or abrupt endings, ever, regardless of which
       branch is taken.
+    - REPEAT/CLARIFY REQUEST (their response to TURN 2 is asking you to
+      repeat, rephrase, or clarify what you just said — e.g. "what?", "can
+      you repeat that?", "sorry, say that again?", "huh?") -> this is NOT an
+      answer to classify. Simply repeat or naturally rephrase the same TURN 2
+      line. Do NOT call opener_result. Do NOT treat this as bad_timing,
+      not_interested, or any other classification below — it's a request to
+      hear it again, nothing more.
     - THIS RULE APPLIES AT TURN 2 ONLY, never at TURN 1 (TURN 1's wrong_number
       handling above is separate and already complete in itself — never apply
       anything below to TURN 1). At TURN 2, if the prospect says anything
@@ -352,6 +549,12 @@ def _opener_block(company: str, city: str, contact_name: str) -> str:
       you pass:
       - If it's a timing thing -> that's bad_timing.
       - If it's a genuine no -> that's not_interested.
+    - If the prospect offers a SHORT WINDOW of time rather than declining
+      (e.g., "I've got 10 seconds," "make it quick," "you've got a minute,"
+      "go fast") — this is ACCEPTANCE, not bad_timing. Treat this as
+      agreeing to listen, and move to the pitch — but deliver it in the
+      MOST crisp, shortened form possible, respecting the time they
+      offered. Do not call opener_result with bad_timing for this case.
     - If they agree to keep listening, that routes to a short pitch next — NOT
       straight to qualifying questions.
 
@@ -367,13 +570,24 @@ def _pitch_block() -> str:
     You are Aiva. The prospect just agreed to listen (said yes to
     the ice breaker).
 
-    You are mid-call. The prospect already heard the ice breaker and
-    AI disclosure from earlier in this conversation. Never repeat
-    the opening greeting, never re-introduce yourself, never
-    re-disclose being an AI unless directly asked again. Jump
-    straight into your own job.
+    NOTE: if they agreed by offering a SHORT WINDOW of time rather than a
+    plain yes (e.g. "I've got 10 seconds," "make it quick," "you've got a
+    minute," "go fast"), deliver the pitch even more tightly than usual —
+    prioritize the core message (who you help, the one differentiator, the
+    closing check-in question) over full script fidelity if time is
+    explicitly limited.
+
+    You are mid-call. Check the actual conversation above — if the
+    prospect has already heard the ice breaker and AI disclosure
+    earlier in this real conversation, do not repeat the opening
+    greeting, re-introduce yourself, or re-disclose being an AI
+    unless directly asked again. If for any reason they haven't
+    (check the actual history, don't assume), handle that naturally
+    instead of skipping ahead. Jump straight into your own job.
 
     {NATURAL_SPEECH_GUIDE}
+
+    {KNOWLEDGE_DEFER_RULE}
 
     YOUR ONLY JOB: deliver the pitch below. USE THIS SCRIPT CLOSELY
     — it is locked-in and approved, not a loose illustration. Do
@@ -414,6 +628,12 @@ def _pitch_block() -> str:
     invoice." This is the only funding-speed detail you may give — never
     imply this applies to a brand-new prospect's first-ever funding from
     this call.
+
+    If asked how much of the invoice gets advanced upfront: "We typically
+    advance somewhere between 80 and 95 percent of the invoice value
+    upfront — the exact number depends on your customers and how the deal
+    is structured." Only say this if they actually ask — never volunteer
+    it as part of the pitch.
     {_PAUSE_MARKER_NOTE}
     RULES:
     - Porter Capital is who Aiva works for — always say "Porter Capital"
@@ -427,7 +647,9 @@ def _pitch_block() -> str:
       from their check-in response into the pitch.
     - The check-in question is soft ("worth a quick chat?"), never a
       qualifying question ("what type of business are you in?").
-    - NEVER quote rates, percentages, or dollar amounts.
+    - NEVER quote rates or dollar amounts EXCEPT the advance-rate answer
+      above, and only if asked directly — that's the one sanctioned
+      exception, never volunteered.
 
     When they respond, call the pitch_result tool — do not write
     it out as text. Speak only the pitch and the check-in question;
@@ -463,13 +685,17 @@ def _qualifying_block(company: str) -> str:
     You are Aiva, an AI sales assistant at Porter Capital.
     You are speaking with someone at {company}.
 
-    You are mid-call. The prospect already heard the ice breaker and
-    AI disclosure from earlier in this conversation. Never repeat
-    the opening greeting, never re-introduce yourself, never
-    re-disclose being an AI unless directly asked again. Jump
-    straight into your own job.
+    You are mid-call. Check the actual conversation above — if the
+    prospect has already heard the ice breaker and AI disclosure
+    earlier in this real conversation, do not repeat the opening
+    greeting, re-introduce yourself, or re-disclose being an AI
+    unless directly asked again. If for any reason they haven't
+    (check the actual history, don't assume), handle that naturally
+    instead of skipping ahead. Jump straight into your own job.
 
     {NATURAL_SPEECH_GUIDE}
+
+    {KNOWLEDGE_DEFER_RULE}
 
     YOUR ONLY JOB: Qualify this prospect naturally.
     Find out what type of business they are, and whether they
@@ -597,8 +823,12 @@ def _qualifying_block(company: str) -> str:
     - If asked about rates specifically (not the funding estimate), say
       only: "Honestly, it depends on a few things — how much you're
       invoicing, your customers, stuff like that. Rates typically run
-      somewhere between 0.2 and 2 percent... but we'd build you an actual
+      somewhere between 0.5 and 3 percent... but we'd build you an actual
       number once we know more."
+    - If asked how much of the invoice gets advanced upfront: "We
+      typically advance somewhere between 80 and 95 percent of the
+      invoice value upfront — the exact number depends on your customers
+      and how the deal is structured."
     - If asked how fast funding happens: "Once you're set up with us,
       we move fast — usually under 48 hours from submitting an invoice."
     - One question at a time. Always.
@@ -619,13 +849,17 @@ def _objection_block(company: str, objection_text: str) -> str:
 
     You are Aiva. The prospect just said: "{objection_text}"
 
-    You are mid-call. The prospect already heard the ice breaker and
-    AI disclosure from earlier in this conversation. Never repeat
-    the opening greeting, never re-introduce yourself, never
-    re-disclose being an AI unless directly asked again. Jump
-    straight into your own job.
+    You are mid-call. Check the actual conversation above — if the
+    prospect has already heard the ice breaker and AI disclosure
+    earlier in this real conversation, do not repeat the opening
+    greeting, re-introduce yourself, or re-disclose being an AI
+    unless directly asked again. If for any reason they haven't
+    (check the actual history, don't assume), handle that naturally
+    instead of skipping ahead. Jump straight into your own job.
 
     {NATURAL_SPEECH_GUIDE}
+
+    {KNOWLEDGE_DEFER_RULE}
 
     Follow this formula STRICTLY: Acknowledge -> Ask a question -> Continue.
     Never defend, never argue, never over-explain. One acknowledgment, one
@@ -663,8 +897,13 @@ def _objection_block(company: str, objection_text: str) -> str:
     "What are your rates" ->
     "Honestly, it depends on a few things — how much you're
      invoicing, your customers, stuff like that. Rates typically
-     run somewhere between 0.2 and 2 percent... but we'd build you
+     run somewhere between 0.5 and 3 percent... but we'd build you
      an actual number once we know more."
+
+    "How much of my invoice do you advance" ->
+    "We typically advance somewhere between 80 and 95 percent of
+     the invoice value upfront — the exact number depends on your
+     customers and how the deal is structured."
 
     "How fast could I get funded" ->
     "Once you're set up with us, we move fast — usually under 48
@@ -682,8 +921,10 @@ def _objection_block(company: str, objection_text: str) -> str:
     - ONE response then stop. Never push twice.
     - If they say no again, accept it gracefully and warmly.
     - NEVER quote a specific rate or percentage beyond the approved
-      0.2-to-2-percent range shown in the script above. Never give a
-      number more precise than that range.
+      0.5-to-3-percent range shown in the script above. Never give a
+      number more precise than that range. The 80-to-95-percent advance
+      range above is a separate, also-approved number — never confuse
+      the two or blend them into one figure.
     - Then call the objection_result tool — do not write it out as
       text. Speak only your acknowledgment and question; the tool
       call itself is a separate, silent action, never part of
@@ -698,13 +939,17 @@ def _booking_block() -> str:
     You are Aiva, an AI sales assistant at Porter Capital.
     The prospect has agreed to speak with a human advisor.
 
-    You are mid-call. The prospect already heard the ice breaker and
-    AI disclosure from earlier in this conversation. Never repeat
-    the opening greeting, never re-introduce yourself, never
-    re-disclose being an AI unless directly asked again. Jump
-    straight into your own job.
+    You are mid-call. Check the actual conversation above — if the
+    prospect has already heard the ice breaker and AI disclosure
+    earlier in this real conversation, do not repeat the opening
+    greeting, re-introduce yourself, or re-disclose being an AI
+    unless directly asked again. If for any reason they haven't
+    (check the actual history, don't assume), handle that naturally
+    instead of skipping ahead. Jump straight into your own job.
 
     {NATURAL_SPEECH_GUIDE}
+
+    {KNOWLEDGE_DEFER_RULE}
 
     YOUR ONLY JOB: Get their callback details naturally.
 
@@ -730,8 +975,13 @@ def _booking_block() -> str:
 
     If asked about rates: "Honestly, it depends on a few things —
     how much you're invoicing, your customers, stuff like that.
-    Rates typically run somewhere between 0.2 and 2 percent... but
+    Rates typically run somewhere between 0.5 and 3 percent... but
     we'd build you an actual number once we know more."
+
+    If asked how much of the invoice gets advanced upfront: "We
+    typically advance somewhere between 80 and 95 percent of the
+    invoice value upfront — the exact number depends on your
+    customers and how the deal is structured."
 
     If asked how fast funding happens: "Once you're set up with us,
     we move fast — usually under 48 hours from submitting an
@@ -745,17 +995,20 @@ def _booking_block() -> str:
     again?" or "Just to confirm, did you mean [X]?" Never proceed
     with uncertain details.
 
-    Confirm back naturally, then call the booking_result tool — do
-    not write it out as text. Speak only your natural confirmation;
-    the tool call itself is a separate, silent action, never part
-    of what you say out loud.
+    Once the callback details are confirmed, call booking_result now
+    with those details, and do not speak anything yourself in this
+    turn — no confirmation, no other words. booking_result speaks
+    the confirmation itself, referencing those details, in a
+    separate, guaranteed step.
 
     RULES:
     - Never say the PROSPECT'S/LEAD'S company name back to them — it's
       internal context only, never spoken aloud. (Porter Capital,
       Aiva's own employer, is separate and fine to say if relevant.)
-    - Never quote rates beyond the approved 0.2-to-2-percent range,
-      and never promise approval
+    - Never quote rates beyond the approved 0.5-to-3-percent range,
+      and never promise approval. The 80-to-95-percent advance range
+      above is a separate, also-approved number — never confuse the
+      two or blend them into one figure.
     - Keep it warm and brief — they already said yes
     """
 
@@ -766,12 +1019,17 @@ def _disclosure_block() -> str:
 
     You are Aiva. Someone just asked if you are human or AI.
 
-    You are mid-call. The prospect already heard the ice breaker
-    earlier in this conversation. Never repeat the opening greeting
-    or re-introduce yourself — just answer the question they just
-    asked and jump straight into your own job.
+    You are mid-call. Check the actual conversation above — if the
+    prospect has already heard the ice breaker earlier in this real
+    conversation, do not repeat the opening greeting or re-introduce
+    yourself, just answer the question they just asked. If for any
+    reason they haven't (check the actual history, don't assume),
+    handle that naturally instead of skipping ahead. Jump straight
+    into your own job.
 
     {NATURAL_SPEECH_GUIDE}
+
+    {KNOWLEDGE_DEFER_RULE}
 
     Answer like this — make it your own version:
     "I am, yeah... happy to keep going, or I can grab you one of
@@ -799,10 +1057,15 @@ def _disclosure_block() -> str:
       follow whichever branch their answer now clearly fits. If it's STILL
       unclear after that one clarifying attempt, default to accepted —
       assume they're fine continuing — rather than guessing blindly.
-    - Then call the disclosure_result tool — do not write it out as
-      text. Speak only your natural reply; the tool call itself is
-      a separate, silent action, never part of what you say out
-      loud.
+    - For accepted or wants_human: then call the disclosure_result
+      tool — do not write it out as text. Speak only your natural
+      reply; the tool call itself is a separate, silent action,
+      never part of what you say out loud.
+    - For wants_to_end: call disclosure_result now with reaction set
+      to wants_to_end, and do not speak anything yourself in this
+      turn — no acknowledgment, no other words. disclosure_result
+      speaks the acknowledgment itself, in a separate, guaranteed
+      step.
     """
 
 
@@ -815,13 +1078,22 @@ def _exit_block() -> str:
 
     {NATURAL_SPEECH_GUIDE}
 
-    YOUR ONLY JOB RIGHT NOW: Acknowledge warmly and end the call.
+    {KNOWLEDGE_DEFER_RULE}
 
-    Sound genuine — not robotic or over-apologetic.
+    YOUR JOB IN THIS STAGE, IN ORDER — check the actual conversation
+    above to see which step you're on, don't assume:
 
-    Example:
-    "Of course — I'll take care of that right now. Thanks for
-     letting me know, and have a good one."
+    1. If you have not yet acknowledged the opt-out request anywhere
+       in this conversation, do so now — warmly, in one or two short
+       sentences, and call no tool this turn. Example:
+       "Of course — I'll take care of that right now. Thanks for
+        letting me know, and have a good one."
+       Sound genuine — not robotic or over-apologetic.
+    2. If you already spoke that acknowledgment (it's your most
+       recent turn above), say nothing further — no repeated
+       acknowledgment, no goodbye, no other words — and call opt_out
+       now. opt_out is a separate, silent action; it is never part of
+       what you say out loud.
 
     {_PAUSE_MARKER_NOTE}
 
@@ -829,16 +1101,12 @@ def _exit_block() -> str:
     - Never say the PROSPECT'S/LEAD'S company name back to them — it's
       internal context only, never spoken aloud. (Porter Capital,
       Aiva's own employer, is separate and fine to say if relevant.)
-    - Speak ONLY the acknowledgment above. Never voice any
-      conditional/meta text describing how to handle this situation
-      (e.g. "if they say remove me" or similar instruction-style
-      phrasing) — that kind of text is internal guidance, not
-      something to say out loud, even if it appears nearby in your
-      instructions.
-
-    Then call opt_out — do not write it out as text. Speak only your
-    acknowledgment; the tool call itself is a separate, silent
-    action, never part of what you say out loud.
+    - Speak ONLY the acknowledgment in step 1, and only once. Never
+      voice any conditional/meta text describing how to handle this
+      situation (e.g. "if they say remove me" or similar
+      instruction-style phrasing) — that kind of text is internal
+      guidance, not something to say out loud, even if it appears
+      nearby in your instructions.
     """
 
 
@@ -852,6 +1120,67 @@ _STAGE_BLOCK_BUILDERS = {
     "booking": lambda self: _booking_block(),
     "disclosure": lambda self: _disclosure_block(),
     "exit": lambda self: _exit_block(),
+}
+
+
+# ============================================================
+# STAGE-TOOL SCOPING — only the current stage's own *_result tool(s) are
+# exposed to the model at any point, instead of all 9 function_tool methods
+# being visible for the whole call (the previous, unscoped default). This
+# stops the model from being ABLE to call e.g. booking_result while still in
+# qualifying. enter_disclosure/enter_exit are excluded from their own target
+# stage (no reason to re-enter disclosure while already in it) but otherwise
+# always exposed, since the prospect can ask "are you human" or "take me off
+# your list" from literally any stage.
+# ============================================================
+
+_STAGE_TOOLS = {
+    "hello": [],
+    "opener": ["opener_result"],
+    "pitch": ["pitch_result"],
+    "qualifying": ["qualifying_result"],
+    "objection": ["objection_result"],
+    "booking": ["booking_result"],
+    "disclosure": ["disclosure_result"],
+    "exit": ["opt_out"],
+}
+
+
+# ============================================================
+# NO-TOOL DRIFT GUARD — see NO_TOOL_DRIFT_LIMIT and
+# _inject_drift_correction(). Maps each stage to the tool it must resolve
+# through and a short description of that decision point, so the same
+# generic correction mechanism produces stage-appropriate wording instead of
+# a one-size-fits-all (or opener-specific) instruction. "hello" is excluded
+# — it has no *_result tool and its own dedicated escalation loop.
+# ============================================================
+
+_STAGE_DECISION_POINTS = {
+    "opener": ("opener_result", "confirming right-person status and reaching interested/not_interested/bad_timing/etc"),
+    "pitch": ("pitch_result", "getting their reaction and moving to qualifying or objection"),
+    "qualifying": ("qualifying_result", "confirming business type/factoring status and moving to booking, objection, or not_qualified"),
+    "objection": ("objection_result", "resolving the objection and returning to still_interested/not_interested/wants_callback"),
+    "booking": ("booking_result", "confirming callback details and completing booking"),
+    "disclosure": ("disclosure_result", "resuming the stage this digression interrupted"),
+    "exit": ("opt_out", "acknowledging and ending the call"),
+}
+
+# KNOWN, LIVE GAP — not theoretical. Live testing (2026-07-21) confirmed the
+# forced-tool_choice drift correction below can make the model guess a
+# specific, wrong outcome (e.g. qualifying_result(result="not_qualified")
+# from a prospect who only ever said "I'm not sure, I'd have to check with
+# my partner") when it's forced to resolve before it has enough real
+# information. qualifying_result now has an "unclear" escape hatch for
+# this (see _STAGE_INSUFFICIENT_INFO_VALUE below and its instruction text
+# in _inject_drift_correction). opener_result, pitch_result,
+# objection_result, disclosure_result, and booking_result do NOT have an
+# equivalent value yet — if drift correction ever fires in those stages,
+# they carry the SAME bad-guess risk, currently unaddressed. Add an
+# "unclear"-equivalent value to each (and a branch that just re-prompts
+# without ending the call or advancing the stage) before relying on forced
+# drift correction in those stages.
+_STAGE_INSUFFICIENT_INFO_VALUE = {
+    "qualifying": "unclear",
 }
 
 
@@ -877,6 +1206,7 @@ class Aiva(SpeechSafetyMixin, Agent):
         self.ctx = ctx
         self.call_result = "no_answer"
         self.current_stage = "hello"
+        self._stages_visited = ["hello"]  # TEMP DEBUG - remove after memory verification test
         self._return_stage = None
         self._objection_text = ""
         self._call_ending = False  # guard against double _end_call()
@@ -891,6 +1221,74 @@ class Aiva(SpeechSafetyMixin, Agent):
         self.referral_details = None
         self.callback_details = None
         self.objection_log    = []
+
+        # TURN-COUNTER GUARD — see _require_confirmed_turn(). Bumped once per
+        # genuine STT-committed user turn (conversation_item_added, role
+        # "user"); stamped into _last_agent_speech_turn_count on every real
+        # assistant turn. A *_result tool is only allowed to act if the
+        # counter has advanced past that stamp, i.e. a real user turn
+        # happened after the question was last spoken. Separate from, and
+        # compatible with, the hello-loop's heard_speech asyncio.Event below
+        # (that one is a coarse "did VAD detect ANY speech" signal scoped to
+        # the silence-timeout escalation window only; this one is a
+        # persistent, STT-committed turn count for the whole call).
+        self._user_turn_count = 0
+        self._last_agent_speech_turn_count = 0
+        self._exit_question_stamp = 0
+
+        # PER-QUESTION VIOLATION COUNTER — see _require_confirmed_turn().
+        # Counts consecutive _require_confirmed_turn() failures for the
+        # question currently in flight (same stage, no confirmed turn yet).
+        # Reset on a confirmed turn and on every stage change (_set_stage),
+        # since either means the model has moved on to a genuinely new
+        # question. Model-agnostic: this is a plain counter + escalating
+        # instructions, no provider-specific logic.
+        self._violation_count = 0
+
+        # WHOLE-CALL VIOLATION COUNTER — see _require_confirmed_turn(). Same
+        # failures as _violation_count above, but NEVER reset on stage
+        # change — only on a genuine confirmed-turn success. Closes the
+        # loophole where hopping stages (opener -> disclosure -> opener...)
+        # resets _violation_count before any single stage reaches 3,
+        # letting a call evade that per-stage safety net indefinitely.
+        self._total_violation_count = 0
+
+        # SAME-BREATH GUARD — see llm_node() override and
+        # _require_confirmed_turn(). True when the model's own in-flight
+        # generation has already streamed new text before/alongside a tool
+        # call in that same generation — i.e. it asked a question and is
+        # trying to answer it itself in one breath, no real user turn in
+        # between. Set synchronously inside llm_node() as raw ChatChunks
+        # stream past (before the SDK's own text-vs-tool-call split, which
+        # commits the text too late to check from inside the tool — see
+        # agent_activity.py: tool execution starts concurrently with, not
+        # after, TTS/text-commit). Consumed (and reset) by
+        # _require_confirmed_turn() on the very next check.
+        self._same_breath_violation = False
+
+        # NO-TOOL DRIFT GUARD — see NO_TOOL_DRIFT_LIMIT above and
+        # _inject_drift_correction(). Consecutive assistant turns, within the
+        # SAME stage, where the generation contained no tool call at all.
+        # _no_tool_turn_streak is reset the instant a tool call is seen
+        # streaming past in llm_node() itself (not deferred to a text-bearing
+        # conversation item, which a tool-only generation may never produce —
+        # see llm_node()). _last_generation_had_tool_call is stamped once per
+        # generation at the tail of llm_node() (same tool_call_seen value
+        # already computed there for the same-breath guard) and consumed in
+        # _on_conversation_item_added() to decide whether to increment. Both
+        # reset on every _set_stage() — a new stage is a fresh decision point
+        # with its own window.
+        self._no_tool_turn_streak = 0
+        self._last_generation_had_tool_call = False
+
+        # RETRY-STAMP SUPPRESSION — see _require_confirmed_turn()'s
+        # escalation ladder and _on_conversation_item_added(). Set just
+        # before that ladder's own re-prompt generate_reply() calls so the
+        # stamp update below skips those turns: a re-prompt the guard itself
+        # generated isn't a new question, and letting it advance
+        # _last_agent_speech_turn_count would invalidate a real answer the
+        # prospect already gave before that re-prompt was spoken.
+        self._suppress_stamp_update = False
 
         self._company = lead.get("company_name", "the company")
         self._city = lead.get("city", "")
@@ -935,9 +1333,315 @@ class Aiva(SpeechSafetyMixin, Agent):
         stage_block = stage_builder(self) if stage_builder else ""
         return header + stage_block
 
-    def _set_stage(self, stage: str):
+    def _current_tools(self):
+        names = list(_STAGE_TOOLS.get(self.current_stage, []))
+        if self.current_stage != "disclosure":
+            names.append("enter_disclosure")
+        if self.current_stage != "exit":
+            names.append("enter_exit")
+        return [getattr(self, n) for n in names]
+
+    async def _set_stage(self, stage: str):
         self.current_stage = stage
-        return self.update_instructions(self._build_instructions())
+        self._violation_count = 0
+        self._no_tool_turn_streak = 0
+        # TEMP DEBUG - remove after memory verification test
+        self._stages_visited.append(stage)
+        print(
+            f"[MEMORY CHECK] stage -> {stage} | chat_ctx turns so far: "
+            f"{len(self.chat_ctx.items)} | stages visited: {self._stages_visited}"
+        )
+        await self.update_instructions(self._build_instructions())
+        await self.update_tools(self._current_tools())
+
+    # --------------------------------------------------------
+    # SAME-BREATH GUARD — see __init__ for field docs. Overrides the public
+    # Agent.llm_node extension point (livekit.agents.voice.agent.Agent,
+    # confirmed against installed livekit-agents==1.6.4) to watch the raw
+    # ChatChunk stream in true model-stream order, before the SDK splits it
+    # into text_ch/function_ch. A synchronous write here is guaranteed to
+    # happen-before the corresponding tool call starts executing (the write
+    # runs before this generator yields that chunk; the SDK can't act on
+    # the chunk until it receives it).
+    # --------------------------------------------------------
+
+    async def llm_node(self, chat_ctx, tools, model_settings):
+        # Text can't be un-spoken once yielded: the SDK forwards each
+        # delta.content chunk to the TTS channel the instant it's yielded
+        # (see generation.py's perform_llm_inference), so by the time a
+        # tool_calls delta shows up later in the same stream, any narration
+        # that preceded it is already on its way to audio. Selectively
+        # dropping only the offending chunk is therefore not an option —
+        # the offending text is usually the chunk(s) *before* the tool call,
+        # not the one carrying it. So this buffers all narrated text for the
+        # whole generation and only releases it once the stream ends with no
+        # tool call ever appearing; if a tool call shows up at any point,
+        # the buffered narration is discarded entirely (never yielded) and
+        # only the tool-call chunk(s) pass through, so the tool still fires
+        # normally. Trade-off: TTS no longer starts speaking until the full
+        # LLM turn finishes, instead of token-by-token — the only way to
+        # guarantee same-breath commentary never reaches audio.
+        #
+        # Full response buffering (not tail-only) is a deliberate, validated
+        # design decision, not a temporary workaround. Researched
+        # alternatives: (1) tail-only/sliding-window buffering — proven
+        # logically insufficient, since narration can precede a tool call by
+        # more than one sentence and there's no way to know the full shape
+        # of the response before it completes; (2) API-level prevention via
+        # tool_choice constraints — confirmed unavailable across OpenAI,
+        # xAI/Grok, and Gemini APIs (all checked, sources in
+        # UPGRADE_NOTES.md); the only constraint that guarantees no bundled
+        # text (tool_choice='required') is incompatible with normal
+        # conversational replies. Measured cost: ~130-215ms added latency
+        # per substantive turn, negligible on short utterances. This cost is
+        # expected to persist even after switching to a stronger/paid model
+        # later, since the underlying model behavior (narrating alongside
+        # tool calls) is universal across providers, not specific to Grok.
+        buffered_text = []
+        tool_call_seen = False
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            delta = getattr(chunk, "delta", None)
+            if delta is not None:
+                has_text = bool(getattr(delta, "content", None))
+                has_tools = bool(getattr(delta, "tool_calls", None))
+                if has_tools:
+                    if buffered_text or has_text:
+                        self._same_breath_violation = True
+                    if not tool_call_seen:
+                        # NO-TOOL DRIFT GUARD — reset the instant a tool call
+                        # is actually seen, not deferred to
+                        # _on_conversation_item_added(). A tool-only
+                        # generation (no narrated text) never produces a
+                        # text-bearing ChatMessage, so if the reset waited
+                        # for one, the very next plain-text generation (e.g.
+                        # a scripted acknowledgment) would overwrite
+                        # _last_generation_had_tool_call to False before this
+                        # generation's "had a tool call" signal was ever
+                        # consumed — silently losing the reset.
+                        self._no_tool_turn_streak = 0
+                    tool_call_seen = True
+                    buffered_text = []
+                    if has_text:
+                        # strip the narrated text off this chunk; the tool
+                        # call itself still passes through untouched
+                        chunk = chunk.model_copy(
+                            update={"delta": delta.model_copy(update={"content": None})}
+                        )
+                    yield chunk
+                    continue
+                if has_text:
+                    buffered_text.append(delta.content)
+                    continue
+                yield chunk
+            elif isinstance(chunk, str) and chunk:
+                buffered_text.append(chunk)
+            else:
+                yield chunk
+        if buffered_text and not tool_call_seen:
+            yield ChatChunk(id="buffered-text", delta=ChoiceDelta(content="".join(buffered_text)))
+        # Consumed by _on_conversation_item_added() — see NO_TOOL_DRIFT_LIMIT.
+        self._last_generation_had_tool_call = tool_call_seen
+
+    # --------------------------------------------------------
+    # TURN-COUNTER GUARD — see __init__ for field docs.
+    # --------------------------------------------------------
+
+    def _on_conversation_item_added(self, event):
+        item = event.item
+        if not isinstance(item, ChatMessage):
+            return
+        if not item.text_content or not item.text_content.strip():
+            return
+        if item.role == "user":
+            self._user_turn_count += 1
+            # GLOBAL TURN-COUNT SAFETY NET — see GLOBAL_TURN_LIMIT above.
+            # Independent of tool calls entirely: fires purely off the real
+            # user-turn count, so it catches a call that never resolves even
+            # if the model never once attempts a *_result tool (the
+            # per-stage/whole-call violation counters below only fire when a
+            # tool call is actually blocked). This callback is synchronous
+            # (SDK event), so the defensive close is scheduled as a task
+            # rather than awaited here.
+            if self._user_turn_count > GLOBAL_TURN_LIMIT and not self._call_ending:
+                print(
+                    f"[GLOBAL TURN LIMIT] call exceeded {GLOBAL_TURN_LIMIT} "
+                    "turns without resolution — ended defensively."
+                )
+                self.call_result = "no_answer"
+                asyncio.create_task(self._end_call(
+                    "Apologize briefly that the call is running long, thank "
+                    "them for their time, and say goodbye. One short "
+                    "sentence."
+                ))
+        elif item.role == "assistant":
+            # TURN-COUNTER GUARD — see _require_confirmed_turn(). Skip the
+            # stamp update for a re-prompt the guard's own escalation ladder
+            # just generated (flagged via _suppress_stamp_update) — that
+            # text isn't a new question, so it must not become the baseline
+            # a genuine prior answer gets checked against.
+            if self._suppress_stamp_update:
+                self._suppress_stamp_update = False
+            else:
+                self._last_agent_speech_turn_count = self._user_turn_count
+            # NO-TOOL DRIFT GUARD — see NO_TOOL_DRIFT_LIMIT above. Hello has
+            # no *_result tool and its own dedicated escalation loop, so it's
+            # excluded here. Orthogonal to the violation ladder below: that
+            # one only counts a tool call that WAS attempted and rejected;
+            # this one only counts turns where no tool call was attempted at
+            # all, so the two never fire on the same turn. The reset side of
+            # this (streak -> 0) now happens synchronously in llm_node() the
+            # instant a tool call streams past — see there — so this branch
+            # only ever increments.
+            if self.current_stage != "hello":
+                if not self._last_generation_had_tool_call:
+                    self._no_tool_turn_streak += 1
+                    if self._no_tool_turn_streak >= NO_TOOL_DRIFT_LIMIT and not self._call_ending:
+                        print(
+                            f"[NO-TOOL DRIFT] {self._no_tool_turn_streak} consecutive "
+                            f"turns in stage '{self.current_stage}' with no tool call "
+                            "— injecting correction."
+                        )
+                        self._no_tool_turn_streak = 0
+                        asyncio.create_task(self._inject_drift_correction())
+
+    async def _inject_drift_correction(self):
+        """Forces the model back onto its stage's decision point after
+        NO_TOOL_DRIFT_LIMIT consecutive turns of free-text-only conversation
+        with no *_result tool attempt — see NO_TOOL_DRIFT_LIMIT above. This
+        is what catches PRODUCTIVE-seeming improvisation (a plausible
+        pitch/qualifying/booking-style conversation carried entirely in free
+        text) that the confirmed-turn violation ladder can't, since that
+        ladder only ever sees a turn where a tool call WAS attempted.
+
+        tool_choice pins the model's next generation to the stage's own
+        *_result tool at the provider API level (OpenAI and Groq both honor
+        named tool_choice — Groq's LLM plugin is a thin subclass of the
+        OpenAI plugin pointed at Groq's OpenAI-compatible endpoint, so this
+        is the same code path for both our primary and failover LLM) —
+        turning this from a hopeful nudge into a real requirement instead of
+        just asking nicely and hoping the model complies next turn.
+
+        The drifted turns already contain real user answers the model never
+        acted on — _last_agent_speech_turn_count was re-stamped after each
+        of those no-tool assistant turns, so _require_confirmed_turn()
+        (called inside the *_result tool this forces) would otherwise see
+        "no user turn since the question was last asked" and bounce the
+        forced call even though the prospect DID just answer something real.
+        Roll the stamp back to just before that last real user turn so the
+        guard recognizes it as legitimate — this preserves the guard's
+        actual purpose (never let the model answer its own brand-new
+        question with zero real user input) instead of bypassing it."""
+        if self._call_ending:
+            return
+        tool_name, decision = _STAGE_DECISION_POINTS.get(self.current_stage, (None, None))
+        if not tool_name:
+            return
+        if self._user_turn_count > 0:
+            self._last_agent_speech_turn_count = self._user_turn_count - 1
+
+        insufficient_info_value = _STAGE_INSUFFICIENT_INFO_VALUE.get(self.current_stage)
+        escape_hatch = (
+            f" If they genuinely haven't given you enough real information "
+            f"to decide accurately, call {tool_name} with result set to "
+            f"'{insufficient_info_value}' rather than guessing a specific "
+            f"outcome."
+            if insufficient_info_value
+            else ""
+        )
+        await self.session.generate_reply(
+            tool_choice={"type": "function", "function": {"name": tool_name}},
+            instructions=(
+                f"You have had several exchanges in this stage without "
+                f"{decision}. You must call {tool_name} now. Base its "
+                "arguments strictly on what the prospect has actually said "
+                "in this conversation — do not guess, invent, or assume "
+                f"anything they did not say.{escape_hatch}"
+            ),
+            allow_interruptions=True,
+        )
+
+    async def _require_confirmed_turn(self, since: int | None = None) -> bool:
+        """True if a genuine user turn was STT-committed after the relevant
+        question was last spoken. Defaults to checking against the live
+        _last_agent_speech_turn_count; pass `since` to check against a
+        frozen stamp instead (see opt_out, which fires immediately after
+        enter_exit's own acknowledgment with no new turn expected in
+        between — its real "confirmed turn" is the one that triggered
+        enter_exit, not one after the acknowledgment). If not confirmed,
+        re-prompts naturally and returns False — callers must return
+        immediately without advancing the stage or fabricating a result.
+        Also fails closed on _same_breath_violation (see llm_node()): a
+        confirmed prior user turn doesn't excuse the model asking a brand
+        new question and answering it itself in the same generation."""
+        stamp = self._last_agent_speech_turn_count if since is None else since
+        same_breath = self._same_breath_violation
+        self._same_breath_violation = False
+        if self._user_turn_count > stamp and not same_breath:
+            self._violation_count = 0
+            self._total_violation_count = 0
+            return True
+
+        self._violation_count += 1
+        self._total_violation_count += 1
+
+        # WHOLE-CALL SAFETY NET — see WHOLE_CALL_VIOLATION_LIMIT above.
+        # Checked before the per-stage ladder so it can catch a call that
+        # keeps failing while hopping stages (each hop resets
+        # _violation_count via _set_stage, but not this one) before any
+        # single stage ever reaches the per-stage 3rd-violation branch below.
+        if self._total_violation_count >= WHOLE_CALL_VIOLATION_LIMIT:
+            print(
+                f"[GLOBAL VIOLATION LIMIT] {self._total_violation_count} "
+                "confirmation failures across stages — call ended "
+                "defensively."
+            )
+            self.call_result = "no_answer"
+            await self._end_call(
+                "Apologize briefly that the call isn't coming through "
+                "clearly, thank them for their time, and say goodbye. One "
+                "short sentence."
+            )
+            return False
+
+        # ESCALATION LADDER — generic, no model-specific wording. 1st
+        # violation: gentle re-prompt. 2nd: forceful, explicit instruction
+        # to break whatever pattern made the model retry identically (also
+        # covers the verbatim-repetition finding). 3rd: safety net — stop
+        # trying to get an answer and end the call defensively instead of
+        # spinning toward MAX_TURNS.
+        if self._violation_count == 1:
+            self._suppress_stamp_update = True
+            await self.session.generate_reply(
+                instructions='Say exactly: "Sorry — didn\'t quite catch that. '
+                'Go ahead." Nothing else.',
+                allow_interruptions=True,
+            )
+        elif self._violation_count == 2:
+            self._suppress_stamp_update = True
+            await self.session.generate_reply(
+                instructions=(
+                    "You have already tried to respond to this without a "
+                    "real answer twice. Do not ask the question again. Do "
+                    "not guess. Wait silently for their actual response. "
+                    "Never repeat your exact previous response "
+                    "word-for-word; if you must say something similar, "
+                    "vary the phrasing."
+                ),
+                allow_interruptions=True,
+            )
+        else:
+            print(
+                f"[VIOLATION GUARD] repeated confirmation failure in stage "
+                f"'{self.current_stage}' ({self._violation_count} attempts) "
+                "— call ended defensively."
+            )
+            self.call_result = "no_answer"
+            await self._end_call(
+                "Apologize briefly that the call isn't coming through "
+                "clearly, thank them for their time, and say goodbye. One "
+                "short sentence."
+            )
+        return False
 
     # --------------------------------------------------------
     # Call ending — same _end_call()/delete_room() pattern as agent.py.
@@ -952,7 +1656,7 @@ class Aiva(SpeechSafetyMixin, Agent):
         self._call_ending = True
         if closing_instructions:
             await self.session.generate_reply(
-                instructions=closing_instructions,
+                instructions=_FINAL_LINE_PREFIX + closing_instructions,
                 allow_interruptions=False,
             )
         await self.ctx.delete_room()
@@ -971,6 +1675,7 @@ class Aiva(SpeechSafetyMixin, Agent):
     # --------------------------------------------------------
 
     async def on_enter(self):
+        await self.update_tools(self._current_tools())
         heard_speech = asyncio.Event()
 
         def _on_user_state(ev):
@@ -1014,8 +1719,14 @@ class Aiva(SpeechSafetyMixin, Agent):
         hung_up / gatekeeper_referral.
         referral_details: the name/contact info they gave for the right
         person, only when result is gatekeeper_referral."""
+        print(
+            f"[OPENER_RESULT DEBUG] called result={result!r} "
+            f"referral_details={referral_details!r} call_ending={self._call_ending}"
+        )
         if self._call_ending:
             return "Call already ending."
+        if not await self._require_confirmed_turn():
+            return "No confirmed user turn since the question was asked; re-prompted."
 
         if result == "gatekeeper_referral":
             print(f"[Gatekeeper referral] {self._company}: {referral_details}")
@@ -1072,6 +1783,8 @@ class Aiva(SpeechSafetyMixin, Agent):
         if result is objection."""
         if self._call_ending:
             return "Call already ending."
+        if not await self._require_confirmed_turn():
+            return "No confirmed user turn since the question was asked; re-prompted."
         if result == "objection":
             await self._raise_objection(objection_text)
             return "Objection raised from pitch."
@@ -1088,11 +1801,23 @@ class Aiva(SpeechSafetyMixin, Agent):
 
     @function_tool()
     async def qualifying_result(self, result: str, objection_text: str = ""):
-        """result: qualified / not_qualified / objection.
+        """result: qualified / not_qualified / objection / unclear.
         objection_text: what they said, only when result is objection
-        (e.g. they already factor invoices with someone else)."""
+        (e.g. they already factor invoices with someone else).
+        unclear: use ONLY when they genuinely have not given enough real
+        information yet to decide — never as a way to avoid a decision you
+        could actually make from what they already said."""
         if self._call_ending:
             return "Call already ending."
+        if not await self._require_confirmed_turn():
+            return "No confirmed user turn since the question was asked; re-prompted."
+        if result == "unclear":
+            await self.session.generate_reply(
+                instructions="You don't have enough real information yet "
+                "to decide. Ask the one specific question you still "
+                "need — do not guess."
+            )
+            return "Unclear — insufficient information, asked clarifying question."
         if result == "objection":
             await self._raise_objection(objection_text)
             return "Objection raised from qualifying."
@@ -1134,6 +1859,8 @@ class Aiva(SpeechSafetyMixin, Agent):
         wants_callback"""
         if self._call_ending:
             return "Call already ending."
+        if not await self._require_confirmed_turn():
+            return "No confirmed user turn since the question was asked; re-prompted."
         if result == "not_interested":
             self.call_result = "not_interested"
             await self._end_call(
@@ -1165,6 +1892,8 @@ class Aiva(SpeechSafetyMixin, Agent):
         """Call when callback details are confirmed."""
         if self._call_ending:
             return "Call already ending."
+        if not await self._require_confirmed_turn():
+            return "No confirmed user turn since the question was asked; re-prompted."
         self.call_result = "callback_booked"
         self.callback_details = callback_details
         await self._end_call(
@@ -1198,6 +1927,8 @@ class Aiva(SpeechSafetyMixin, Agent):
         """reaction: accepted / wants_human / wants_to_end"""
         if self._call_ending:
             return "Call already ending."
+        if not await self._require_confirmed_turn():
+            return "No confirmed user turn since the question was asked; re-prompted."
         if reaction == "wants_human":
             await self._set_stage("booking")
             await self.session.generate_reply(
@@ -1227,6 +1958,7 @@ class Aiva(SpeechSafetyMixin, Agent):
         stop calling, before acknowledging."""
         if self._call_ending:
             return "Call already ending."
+        self._exit_question_stamp = self._last_agent_speech_turn_count
         await self._set_stage("exit")
         await self.session.generate_reply(
             instructions="Acknowledge naturally and warmly, with a brief "
@@ -1239,6 +1971,8 @@ class Aiva(SpeechSafetyMixin, Agent):
         """Call immediately after acknowledging the opt-out request."""
         if self._call_ending:
             return "Call already ending."
+        if not await self._require_confirmed_turn(since=self._exit_question_stamp):
+            return "No confirmed user turn since the opt-out request; re-prompted."
         if os.getenv("TEST_MODE", "false").lower() == "true":
             print(
                 "TEST MODE — suppression_list NOT updated. Would have added: "
@@ -1278,8 +2012,6 @@ def _build_llm(provider: str):
                 timeout=10.0,
             )
         return inference.LLM(model=grok_model)
-    elif provider == "claude":
-        return anthropic.LLM(model="claude-haiku-4-5")
     elif provider == "gpt":
         return openai_plugin.LLM(model="gpt-4o-mini")
     elif provider == "qwen":
@@ -1307,7 +2039,7 @@ def get_llm():
     primary = _build_llm(provider)
 
     failover_provider = os.getenv("LLM_FAILOVER_PROVIDER", "").lower()
-    if provider == "groq" and failover_provider and failover_provider != provider:
+    if failover_provider and failover_provider != provider:
         try:
             fallback = _build_llm(failover_provider)
         except Exception as e:
@@ -1424,6 +2156,10 @@ async def when_call_starts(ctx: JobContext):
     pipeline.on(
         "conversation_item_added",
         transcript.on_conversation_item_added,
+    )
+    pipeline.on(
+        "conversation_item_added",
+        aiva._on_conversation_item_added,
     )
 
     call_ended = asyncio.Event()

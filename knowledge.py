@@ -25,10 +25,10 @@ who'd actually know that off the top of their head."
 RATES
 "Yeah so honestly it depends — how much you're invoicing, who
 your customers are, stuff like that. Rates typically run somewhere
-between 0.2 and 2 percent, but we'd build you an actual number
+between 0.5 and 3 percent, but we'd build you an actual number
 once we know more."
 
-Never a specific number beyond the 0.2-2% range.
+Never a specific number beyond the 0.5-3% range.
 
 FUNDING SPEED
 "Once you're set up with us, we move fast — usually under 48

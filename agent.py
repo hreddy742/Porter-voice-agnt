@@ -22,7 +22,7 @@ from livekit.agents import (
     function_tool,
     JobContext,
 )
-from livekit.agents.llm import FallbackAdapter
+from livekit.agents.llm import FallbackAdapter, ChatMessage
 from livekit.agents import inference
 from livekit.plugins import groq, cartesia, deepgram, silero, anthropic, openai as openai_plugin, elevenlabs
 from db import create_call, get_next_lead, update_lead_status, add_to_suppression
@@ -84,7 +84,7 @@ The most important rules:
    - Use em-dashes for a small break in thought
      Example: "We work with — pretty much any B2B business."
    - Occasionally trail off naturally instead of finishing formally
-     Example: "Rates run about 0.2 to 2 percent, but yeah — depends
+     Example: "Rates run about 0.5 to 3 percent, but yeah — depends
      on the specifics."
    - Break up long sentences into two shorter ones with a pause
      between them rather than one long flowing sentence
@@ -93,6 +93,31 @@ The most important rules:
      a perfectly smooth sentence: "We — we can definitely look into
      that for you."
 """
+
+KNOWLEDGE_DEFER_RULE = """
+ANSWER WHAT YOU KNOW, DEFER ONLY WHAT YOU DON'T:
+Answer directly and confidently anything covered by your knowledge base or
+this task's script — never defer something you actually know. If a question
+(or part of a multi-part question) touches a specific fact, number, or stat
+you don't actually have in your knowledge — answer whichever parts you DO
+know directly, and for the specific unknown part only, say something like
+"That exact number I'd have to check with our team, but I can tell you
+[the part you do know]" — never invent a specific number or fact you don't
+have, even for just one piece of a larger question.
+"""
+
+# _END_CALL CLOSING-LINE GUARD — prepended to every closing_instructions
+# passed to _end_call(). Without this, the model sometimes treats the
+# closing instruction as a suggestion and tacks on an off-script follow-up
+# question instead of ending the call. This makes "no next turn, no
+# question, say only this" explicit regardless of which LLM is active.
+_FINAL_LINE_PREFIX = (
+    "This is the last thing you say before the call ends — there is no "
+    "next turn, so do not ask any question and do not offer anything "
+    "further. Do not repeat your exact previous response word-for-word; "
+    "vary the phrasing if it's similar to something already said. Say "
+    "only the following, then stop: "
+)
 
 
 # ============================================================
@@ -153,18 +178,129 @@ def strip_leaked_meta_text(text: str) -> str:
     return text.strip()
 
 
+# ============================================================
+# RATE-GUARDRAIL — TWO sanctioned ranges, told apart by context:
+#   FEE     (what Porter charges, monthly, on outstanding invoices): 0.5-3%
+#   ADVANCE (% of invoice value paid upfront):                       80-95%
+# For either range, only the range itself — never a single confident
+# number — is sanctioned dialogue. Context is decided by scanning a window
+# of text around each matched number for keyword cues (_FEE_CONTEXT /
+# _ADVANCE_CONTEXT below): "rate"/"fee"/"charge"/"percent...depends" mark a
+# FEE mention, "advance"/"upfront"/"of your invoice" mark an ADVANCE
+# mention. A number that can't be pinned to exactly one context (both cue
+# sets hit, or neither) is treated conservatively as a violation — never
+# guessed into whichever range happens to contain the value.
+# Dollar figures (funding estimates) never match: the regex requires a
+# trailing % or "percent", which those figures never have.
+# ============================================================
+_FEE_RANGE = (0.5, 3.0)
+_ADVANCE_RANGE = (80.0, 95.0)
+
+_NUM = r'\d+(?:\.\d+)?'
+_RATE_RANGE = re.compile(rf'({_NUM})\s*(?:to|and|-|–|—)\s*({_NUM})\s*(?:%|percent\b)', re.IGNORECASE)
+_RATE_SINGLE = re.compile(rf'({_NUM})\s*(?:%|percent\b)', re.IGNORECASE)
+_RATE_HEDGE = re.compile(r'(?:around|about|approximately|roughly|somewhere\s+(?:around|between|near)|close\s+to)\s*$', re.IGNORECASE)
+
+# Context cues, checked in a window of text around each matched number.
+_FEE_CONTEXT = re.compile(r'\b(rate|rates|fee|fees|charge|charges|charging)\b', re.IGNORECASE)
+_FEE_CONTEXT_DEPENDS = re.compile(r'percent\b.{0,40}?\bdepends\b', re.IGNORECASE | re.DOTALL)
+_ADVANCE_CONTEXT = re.compile(r'\b(advance|advanced|advancing|upfront|up\s+front)\b|\bof\s+(?:your|the)\s+invoice\b', re.IGNORECASE)
+_CONTEXT_WINDOW = 80  # chars of surrounding text scanned for context cues
+
+RATE_FALLBACK_LINE = (
+    "Rates typically run somewhere between 0.5 and 3 percent — "
+    "I'll get you the exact number through one of our advisors."
+)
+ADVANCE_FALLBACK_LINE = (
+    "We typically advance somewhere between 80 and 95 percent of the "
+    "invoice value upfront — I'll get you the exact number through one "
+    "of our advisors."
+)
+
+
+def _classify_rate_context(text: str, start: int, end: int) -> str:
+    """Classify the number/range at text[start:end] as 'fee', 'advance', or
+    'unclear', based on keyword cues in a window of surrounding text."""
+    window = text[max(0, start - _CONTEXT_WINDOW): end + _CONTEXT_WINDOW]
+    is_fee = bool(_FEE_CONTEXT.search(window) or _FEE_CONTEXT_DEPENDS.search(window))
+    is_advance = bool(_ADVANCE_CONTEXT.search(window))
+    if is_fee and not is_advance:
+        return "fee"
+    if is_advance and not is_fee:
+        return "advance"
+    return "unclear"
+
+
+def find_rate_violation(text: str):
+    """Return (description, fallback_line) for the first out-of-policy rate
+    mention, or None. An unclassifiable context always counts as a
+    violation (conservative default) and uses the FEE fallback line, since
+    that's the older, more commonly triggered of the two rules."""
+    range_spans = []
+    for m in _RATE_RANGE.finditer(text):
+        range_spans.append((m.start(), m.end()))
+        low, high = float(m.group(1)), float(m.group(2))
+        context = _classify_rate_context(text, m.start(), m.end())
+        if context == "unclear":
+            return f"unclassifiable rate range '{m.group(0).strip()}'", RATE_FALLBACK_LINE
+        lo, hi = _FEE_RANGE if context == "fee" else _ADVANCE_RANGE
+        fallback = RATE_FALLBACK_LINE if context == "fee" else ADVANCE_FALLBACK_LINE
+        if not (lo <= low <= hi and lo <= high <= hi):
+            return f"out-of-range {context} range '{m.group(0).strip()}'", fallback
+
+    for m in _RATE_SINGLE.finditer(text):
+        if any(start <= m.start() < end for start, end in range_spans):
+            continue  # already covered as part of a range match above
+        value = float(m.group(1))
+        context = _classify_rate_context(text, m.start(), m.end())
+        if context == "unclear":
+            return f"unclassifiable rate '{m.group(0).strip()}'", RATE_FALLBACK_LINE
+        lo, hi = _FEE_RANGE if context == "fee" else _ADVANCE_RANGE
+        fallback = RATE_FALLBACK_LINE if context == "fee" else ADVANCE_FALLBACK_LINE
+        if not (lo <= value <= hi):
+            return f"out-of-range {context} rate '{m.group(0).strip()}'", fallback
+        if not _RATE_HEDGE.search(text[:m.start()]):
+            return f"unhedged firm {context} quote '{m.group(0).strip()}'", fallback
+
+    return None
+
+
 class SpeechSafetyMixin:
-    """Mixed into every Agent/AgentTask so its spoken output passes through
-    strip_leaked_meta_text before synthesis, regardless of which task is active."""
+    """Mixed into every Agent/AgentTask so BOTH its spoken audio and the text
+    logged as its conversation-history item pass through the same
+    strip_leaked_meta_text + rate-guardrail filtering, regardless of which
+    task is active.
+
+    tts_node (audio) and transcription_node (chat-history/transcript text)
+    each get their own independent tee'd copy of the same raw LLM text (see
+    AgentActivity._pipeline_reply_task_impl's `tee = itertools.tee(text, 2)`
+    in the livekit-agents SDK) — filtering only one of them left the other
+    carrying the original, unfiltered text straight into
+    conversation_item_added and the persisted transcript, so a detected
+    rate violation was blocked from audio but still logged/persisted
+    verbatim. Both nodes now run the identical filter over their own copy
+    so the two always converge on the same final (possibly substituted)
+    text.
+    """
+
+    @staticmethod
+    async def _filtered_text(text):
+        full_text = "".join([chunk async for chunk in text])
+        cleaned = strip_leaked_meta_text(full_text)
+        if not cleaned:
+            return
+        violation = find_rate_violation(cleaned)
+        if violation:
+            description, fallback_line = violation
+            print(f"[RATE GUARDRAIL] blocked text ({description}): {cleaned!r}")
+            cleaned = fallback_line
+        yield cleaned
 
     async def tts_node(self, text, model_settings):
-        async def _filtered():
-            full_text = "".join([chunk async for chunk in text])
-            cleaned = strip_leaked_meta_text(full_text)
-            if cleaned:
-                yield cleaned
+        return Agent.default.tts_node(self, self._filtered_text(text), model_settings)
 
-        return Agent.default.tts_node(self, _filtered(), model_settings)
+    async def transcription_node(self, text, model_settings):
+        return Agent.default.transcription_node(self, self._filtered_text(text), model_settings)
 
     def _finish_task(self, result):
         """Shared chokepoint for every task's completion path (task_complete
@@ -260,6 +396,8 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
 
             {NATURAL_SPEECH_GUIDE}
 
+            {KNOWLEDGE_DEFER_RULE}
+
             YOUR ONLY JOB: Open this call like a real human phone rep would
             — confirm you've reached the right company/person FIRST, and only
             disclose the AI/cold-call framing and ask for time AFTER that's
@@ -284,6 +422,14 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
               "Hey — I'm trying to reach {company}, is that who I've got?"
 
             Listen to their answer and branch:
+            - REPEAT/CLARIFY REQUEST (they're asking you to repeat,
+              rephrase, or clarify the question itself — e.g. "what?", "can
+              you repeat that?", "sorry, say that again?", "huh?") -> this
+              is NOT an answer to classify. Simply repeat or naturally
+              rephrase the same question. Do NOT call task_complete. Do NOT
+              treat this as confirmation, denial, unclear, or any other
+              classification below — it's a request to hear the question
+              again, nothing more.
             - CONFIRMED (yes, this is {company}/{contact_name}, or anything
               affirming it)
               -> move to the RIGHT-PERSON CHECK below, in your next reply.
@@ -303,6 +449,14 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
               "Ah — are you with {company} at all, or is this a different
                business?"
               This is TURN 1B. Listen to their answer and branch:
+              - REPEAT/CLARIFY REQUEST (they're asking you to repeat,
+                rephrase, or clarify the question itself — e.g. "what?",
+                "can you repeat that?", "sorry, say that again?", "huh?")
+                -> this is NOT an answer to classify. Simply repeat or
+                naturally rephrase the same question. Do NOT call
+                task_complete. Do NOT treat this as confirmation, denial,
+                unclear, or any other classification below — it's a request
+                to hear the question again, nothing more.
               - They confirm they ARE with {company} after all -> this is
                 NOT a wrong number. Move to the RIGHT-PERSON CHECK below, in
                 your next reply, exactly as if they'd confirmed the first
@@ -351,6 +505,14 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
              handles it?"
 
             Listen to their answer and branch:
+            - REPEAT/CLARIFY REQUEST (they're asking you to repeat,
+              rephrase, or clarify the question itself — e.g. "what?", "can
+              you repeat that?", "sorry, say that again?", "huh?") -> this
+              is NOT an answer to classify. Simply repeat or naturally
+              rephrase the same question. Do NOT call task_complete. Do NOT
+              treat this as confirmation, denial, unclear, or any other
+              classification below — it's a request to hear the question
+              again, nothing more.
             - CONFIRMS they ARE the right person (e.g. "yes, that's me,"
               "I handle that," or any other affirming answer) -> move to
               TURN 2 below, in your next reply. Do not call task_complete
@@ -426,6 +588,14 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
               include a warm sign-off (e.g. "have a good day," "take care,"
               "thanks so much") before the call ends. No silent or abrupt
               endings, ever, regardless of which branch is taken.
+            - REPEAT/CLARIFY REQUEST (their response to TURN 2 is asking
+              you to repeat, rephrase, or clarify what you just said — e.g.
+              "what?", "can you repeat that?", "sorry, say that again?",
+              "huh?") -> this is NOT an answer to classify. Simply repeat
+              or naturally rephrase the same TURN 2 line. Do NOT call
+              task_complete. Do NOT treat this as bad_timing,
+              not_interested, or any other classification below — it's a
+              request to hear it again, nothing more.
             - THIS RULE APPLIES AT TURN 2 ONLY, never at TURN 1 (TURN 1's
               wrong_number handling above is separate and already complete
               in itself — never apply anything below to TURN 1). At TURN 2,
@@ -446,6 +616,13 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
               result you pass:
               - If it's a timing thing -> that's bad_timing.
               - If it's a genuine no -> that's not_interested.
+            - If the prospect offers a SHORT WINDOW of time rather than
+              declining (e.g., "I've got 10 seconds," "make it quick,"
+              "you've got a minute," "go fast") — this is ACCEPTANCE, not
+              bad_timing. Treat this as agreeing to listen, and move to the
+              pitch — but deliver it in the MOST crisp, shortened form
+              possible, respecting the time they offered. Do not call
+              task_complete with bad_timing for this case.
             - If they agree to keep listening, that routes to a short pitch
               next — NOT straight to qualifying questions.
             """
@@ -485,6 +662,37 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
                 # through the _hello_phase_active gate) — nothing left
                 # for this loop to do.
                 return
+            if attempt == 0:
+                # HELLO-RACE GUARD — reaching this line already took two
+                # sequential LLM round-trips (the start_call tool-call
+                # decision, then this method being scheduled), on top of
+                # room/audio connect. A prospect who answers instantly can
+                # speak before any of that resolves, and STT commits it into
+                # chat_ctx before Aiva has said a word. If that utterance is
+                # left in context, the model conditions its "exactly Hello?"
+                # generation on it and improvises a reply instead — which is
+                # how a real prospect's own greeting can make Aiva skip
+                # straight past the scripted opener. Anything already in
+                # chat_ctx at this point predates Aiva's first spoken word,
+                # so it isn't a reply to anything she's said and must not
+                # influence what she says first — strip it before asking
+                # for the hello generation.
+                stale_user_turns = [
+                    item for item in self.chat_ctx.items
+                    if isinstance(item, ChatMessage) and item.role == "user"
+                ]
+                if stale_user_turns:
+                    print(
+                        f"[OpenerTask] discarding {len(stale_user_turns)} "
+                        "user turn(s) that arrived before Aiva's first "
+                        "spoken word"
+                    )
+                    trimmed_ctx = self.chat_ctx.copy()
+                    trimmed_ctx.items = [
+                        item for item in trimmed_ctx.items
+                        if not (isinstance(item, ChatMessage) and item.role == "user")
+                    ]
+                    await self.update_chat_ctx(trimmed_ctx)
             await self.session.generate_reply(
                 instructions=_HELLO_ATTEMPT_INSTRUCTIONS[attempt]
             )
@@ -580,6 +788,13 @@ class PitchTask(SpeechSafetyMixin, AgentTask):
             You are Aiva. The prospect just agreed to listen (said yes to
             the ice breaker).
 
+            NOTE: if they agreed by offering a SHORT WINDOW of time rather
+            than a plain yes (e.g. "I've got 10 seconds," "make it quick,"
+            "you've got a minute," "go fast"), deliver the pitch even more
+            tightly than usual — prioritize the core message (who you help,
+            the one differentiator, the closing check-in question) over
+            full script fidelity if time is explicitly limited.
+
             You are mid-call. The prospect already heard the ice breaker and
             AI disclosure from earlier in this conversation. Never repeat
             the opening greeting, never re-introduce yourself, never
@@ -587,6 +802,8 @@ class PitchTask(SpeechSafetyMixin, AgentTask):
             straight into your own job.
 
             {NATURAL_SPEECH_GUIDE}
+
+            {KNOWLEDGE_DEFER_RULE}
 
             YOUR ONLY JOB: deliver the pitch below. USE THIS SCRIPT CLOSELY
             — it is locked-in and approved, not a loose illustration. Do
@@ -630,6 +847,12 @@ class PitchTask(SpeechSafetyMixin, AgentTask):
             give — never imply this applies to a brand-new prospect's
             first-ever funding from this call.
 
+            If asked how much of the invoice gets advanced upfront: "We
+            typically advance somewhere between 80 and 95 percent of the
+            invoice value upfront — the exact number depends on your
+            customers and how the deal is structured." Only say this if
+            they actually ask — never volunteer it as part of the pitch.
+
             Pause markers in these examples are deliberate:
             - '...' = a natural breath, hesitation, or thinking moment
             - Em-dashes = a pivot point, brief pause before a new thought
@@ -650,7 +873,9 @@ class PitchTask(SpeechSafetyMixin, AgentTask):
               Go straight from their check-in response into the pitch.
             - The check-in question is soft ("worth a quick chat?"),
               never a qualifying question ("what type of business are you in?").
-            - NEVER quote rates, percentages, or dollar amounts.
+            - NEVER quote rates or dollar amounts EXCEPT the advance-rate
+              answer above, and only if asked directly — that's the one
+              sanctioned exception, never volunteered.
 
             When they respond, call the task_complete tool — do not write
             it out as text. Speak only the pitch and the check-in question;
@@ -715,6 +940,8 @@ class QualifierTask(SpeechSafetyMixin, AgentTask):
             straight into your own job.
 
             {NATURAL_SPEECH_GUIDE}
+
+            {KNOWLEDGE_DEFER_RULE}
 
             YOUR ONLY JOB: Qualify this prospect naturally.
             Find out what type of business they are, and whether they
@@ -852,8 +1079,12 @@ class QualifierTask(SpeechSafetyMixin, AgentTask):
               say only:
               "Honestly, it depends on a few things — how much you're
                invoicing, your customers, stuff like that. Rates typically
-               run somewhere between 0.2 and 2 percent... but we'd build you
+               run somewhere between 0.5 and 3 percent... but we'd build you
                an actual number once we know more."
+            - If asked how much of the invoice gets advanced upfront:
+              "We typically advance somewhere between 80 and 95 percent of
+               the invoice value upfront — the exact number depends on your
+               customers and how the deal is structured."
             - If asked how fast funding happens: "Once you're set up with
               us, we move fast — usually under 48 hours from submitting an
               invoice."
@@ -904,6 +1135,8 @@ class ObjectionTask(SpeechSafetyMixin, AgentTask):
 
             {NATURAL_SPEECH_GUIDE}
 
+            {KNOWLEDGE_DEFER_RULE}
+
             Follow this formula STRICTLY: Acknowledge -> Ask a question -> Continue.
             Never defend, never argue, never over-explain. One acknowledgment,
             one question, then stop.
@@ -940,8 +1173,13 @@ class ObjectionTask(SpeechSafetyMixin, AgentTask):
             "What are your rates" ->
             "Honestly, it depends on a few things — how much you're
              invoicing, your customers, stuff like that. Rates typically
-             run somewhere between 0.2 and 2 percent... but we'd build you
+             run somewhere between 0.5 and 3 percent... but we'd build you
              an actual number once we know more."
+
+            "How much of my invoice do you advance" ->
+            "We typically advance somewhere between 80 and 95 percent of
+             the invoice value upfront — the exact number depends on your
+             customers and how the deal is structured."
 
             "How fast could I get funded" ->
             "Once you're set up with us, we move fast — usually under 48
@@ -964,8 +1202,10 @@ class ObjectionTask(SpeechSafetyMixin, AgentTask):
             - ONE response then stop. Never push twice.
             - If they say no again, accept it gracefully and warmly.
             - NEVER quote a specific rate or percentage beyond the approved
-              0.2-to-2-percent range shown in the script above. Never give a
-              number more precise than that range.
+              0.5-to-3-percent range shown in the script above. Never give a
+              number more precise than that range. The 80-to-95-percent
+              advance range above is a separate, also-approved number —
+              never confuse the two or blend them into one figure.
             - Then call the task_complete tool — do not write it out as
               text. Speak only your acknowledgment and question; the tool
               call itself is a separate, silent action, never part of
@@ -1004,6 +1244,8 @@ class BookingTask(SpeechSafetyMixin, AgentTask):
 
             {NATURAL_SPEECH_GUIDE}
 
+            {KNOWLEDGE_DEFER_RULE}
+
             YOUR ONLY JOB: Get their callback details naturally.
 
             Do not make this feel like filling out a form.
@@ -1028,8 +1270,13 @@ class BookingTask(SpeechSafetyMixin, AgentTask):
 
             If asked about rates: "Honestly, it depends on a few things —
             how much you're invoicing, your customers, stuff like that.
-            Rates typically run somewhere between 0.2 and 2 percent... but
+            Rates typically run somewhere between 0.5 and 3 percent... but
             we'd build you an actual number once we know more."
+
+            If asked how much of the invoice gets advanced upfront: "We
+            typically advance somewhere between 80 and 95 percent of the
+            invoice value upfront — the exact number depends on your
+            customers and how the deal is structured."
 
             If asked how fast funding happens: "Once you're set up with us,
             we move fast — usually under 48 hours from submitting an
@@ -1052,10 +1299,13 @@ class BookingTask(SpeechSafetyMixin, AgentTask):
             - Never say the PROSPECT'S/LEAD'S company name back to them — it's
               internal context only, never spoken aloud. (Porter Capital,
               Aiva's own employer, is separate and fine to say if relevant.)
-            - Never quote rates beyond the approved 0.2-to-2-percent range,
-              and never promise approval
+            - Never quote rates beyond the approved 0.5-to-3-percent range,
+              and never promise approval. The 80-to-95-percent advance
+              range above is a separate, also-approved number — never
+              confuse the two or blend them into one figure.
             - Keep it warm and brief — they already said yes
             """.replace("{NATURAL_SPEECH_GUIDE}", NATURAL_SPEECH_GUIDE)
+            .replace("{KNOWLEDGE_DEFER_RULE}", KNOWLEDGE_DEFER_RULE)
         )
 
     async def on_enter(self):
@@ -1086,6 +1336,8 @@ class DisclosureTask(SpeechSafetyMixin, AgentTask):
             asked and jump straight into your own job.
 
             {NATURAL_SPEECH_GUIDE}
+
+            {KNOWLEDGE_DEFER_RULE}
 
             Answer like this — make it your own version:
             "I am, yeah... happy to keep going, or I can grab you one of
@@ -1146,6 +1398,8 @@ class ExitTask(SpeechSafetyMixin, AgentTask):
             The prospect wants to be removed from our call list.
 
             {NATURAL_SPEECH_GUIDE}
+
+            {KNOWLEDGE_DEFER_RULE}
 
             YOUR ONLY JOB: Acknowledge warmly and end the call.
 
@@ -1279,7 +1533,7 @@ class PorterSupervisor(SpeechSafetyMixin, Agent):
         """
         if closing_instructions:
             await self.session.generate_reply(
-                instructions=closing_instructions,
+                instructions=_FINAL_LINE_PREFIX + closing_instructions,
                 allow_interruptions=False,
             )
         await self.ctx.delete_room()
