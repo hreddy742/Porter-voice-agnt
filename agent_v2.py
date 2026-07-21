@@ -19,6 +19,7 @@ import re
 import time
 import json
 import asyncio
+import difflib
 import urllib.request
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -299,7 +300,52 @@ WHOLE_CALL_VIOLATION_LIMIT = int(os.getenv("WHOLE_CALL_VIOLATION_LIMIT", "5"))
 # on the same turn. 3 consecutive no-tool turns in one stage is enough to
 # catch drift while still allowing the 1-2 turn clarifying-question retries
 # stage instructions already permit.
+#
+# REPEAT vs. DRIFT split (2026-07-21 live-call finding): a run of
+# REPEAT/CLARIFY turns (prospect keeps saying "what?"/"sorry?") was
+# incrementing this SAME counter as genuine free-text drift, and tripped
+# forced tool_choice with zero real answer ever given — see
+# REPEAT_REQUEST_LIMIT below, which now catches that case separately and
+# earlier, with a neutral (non-guessing) resolution. A no-tool turn only
+# counts toward THIS counter when it is NOT a near-repeat of the immediately
+# preceding no-tool turn (see _is_repeat_of_previous()); repeats count
+# toward _repeat_request_streak instead and do not add to this one.
 NO_TOOL_DRIFT_LIMIT = int(os.getenv("NO_TOOL_DRIFT_LIMIT", "3"))
+
+# Per-stage override for NO_TOOL_DRIFT_LIMIT. Opener is the one stage with a
+# mandatory MULTI-question shape before its own *_result tool is ever
+# callable — TURN 1 -> (TURN 1B, if TURN 1 was ambiguous) -> RIGHT-PERSON
+# CHECK -> TURN 2 is up to 4 legitimate, mutually-DIFFERENT (not
+# text-similar, so not absorbed by the repeat/drift split above) no-tool
+# turns on a totally clean call with zero drift and zero repeats (verified
+# live 2026-07-21 — see test_opener_cleanpath_live_manual.py). The default
+# limit of 3 fires exactly when TURN 2 is spoken, before the prospect has
+# said anything about it. 5 is the tight minimum that never fires during
+# that legitimate 4-turn chain and still catches one genuine no-tool turn
+# beyond it.
+# KNOWN, ACKNOWLEDGED GAP: a rarer double-ambiguous path (TURN 1 unclear ->
+# one clarifying question -> TURN 1B -> RIGHT-PERSON CHECK -> TURN 2) can
+# legitimately stack to 5 no-tool turns before TURN 2, tying this limit.
+# Not fixed here — narrow enough, and clarifying-question wording is model-
+# generated free text the repeat classifier may or may not catch as similar
+# to what preceded it. Revisit if live testing ever shows it firing on that
+# specific path.
+_STAGE_DRIFT_LIMIT_OVERRIDE = {
+    "opener": 5,
+}
+
+# REPEAT-REQUEST GUARD — see _is_repeat_of_previous() and
+# _handle_repeat_loop(). Consecutive no-tool assistant turns whose text is a
+# near-repeat of the immediately preceding one (the model re-asking/
+# rephrasing the SAME pending question, per the REPEAT/CLARIFY and CONFUSED
+# instruction branches). A tighter threshold than NO_TOOL_DRIFT_LIMIT is
+# correct here: unlike generic "no tool call" (ambiguous between legitimate
+# script progress and drift), a repeated identical question with still no
+# real answer is an unambiguous signal something's wrong (bad connection,
+# genuine incomprehension) — 2 consecutive unresolved repeats is enough,
+# waiting for a 3rd only prolongs an unresolvable call.
+REPEAT_REQUEST_LIMIT = int(os.getenv("REPEAT_REQUEST_LIMIT", "2"))
+_REPEAT_SIMILARITY_THRESHOLD = 0.6
 
 # _END_CALL CLOSING-LINE GUARD — prepended to every closing_instructions
 # passed to _end_call(). Without this, the model sometimes treats the
@@ -371,6 +417,19 @@ def _opener_block(company: str, city: str, contact_name: str) -> str:
     internal context above — that knowledge is for you only and never counts
     as confirmation. The ONLY thing that satisfies TURN 1 is the prospect
     themselves confirming it out loud, in this conversation.
+
+    CALLER-IDENTITY QUESTION BEFORE TURN 2 — if the prospect asks who's
+    calling, who this is, or who they're speaking with, at any point before
+    TURN 2 (even combined with confirming TURN 1, e.g. "yes it is, who's
+    this?") -> answer honestly but briefly, in the same breath if they
+    already confirmed: "I'm calling from Porter Capital." Do NOT yet say
+    this is a cold call and do NOT yet say you're an AI/Aiva — that full
+    disclosure is reserved for TURN 2, below. This is a different case from
+    CONFUSED below (which is about not having caught {company}/
+    {contact_name} itself) — this is the prospect already having confirmed,
+    and separately asking who you are. After the one-line answer, continue
+    immediately with the RIGHT-PERSON CHECK (or your next scripted step),
+    naturally.
 
     TURN 1 — COMPANY/CONTACT CONFIRMATION ONLY. Ask exactly this, nothing more
     (no disclosure, no Porter Capital mention yet):
@@ -1080,20 +1139,13 @@ def _exit_block() -> str:
 
     {KNOWLEDGE_DEFER_RULE}
 
-    YOUR JOB IN THIS STAGE, IN ORDER — check the actual conversation
-    above to see which step you're on, don't assume:
-
-    1. If you have not yet acknowledged the opt-out request anywhere
-       in this conversation, do so now — warmly, in one or two short
-       sentences, and call no tool this turn. Example:
-       "Of course — I'll take care of that right now. Thanks for
-        letting me know, and have a good one."
-       Sound genuine — not robotic or over-apologetic.
-    2. If you already spoke that acknowledgment (it's your most
-       recent turn above), say nothing further — no repeated
-       acknowledgment, no goodbye, no other words — and call opt_out
-       now. opt_out is a separate, silent action; it is never part of
-       what you say out loud.
+    Acknowledge the opt-out request now — warmly, in one or two short
+    sentences, and call no tool. Example:
+    "Of course — I'll take care of that right now. Thanks for
+     letting me know, and have a good one."
+    Sound genuine — not robotic or over-apologetic. Suppression and
+    call-ending happen automatically in code right after you finish
+    speaking — you don't call any tool for it.
 
     {_PAUSE_MARKER_NOTE}
 
@@ -1101,8 +1153,8 @@ def _exit_block() -> str:
     - Never say the PROSPECT'S/LEAD'S company name back to them — it's
       internal context only, never spoken aloud. (Porter Capital,
       Aiva's own employer, is separate and fine to say if relevant.)
-    - Speak ONLY the acknowledgment in step 1, and only once. Never
-      voice any conditional/meta text describing how to handle this
+    - Speak ONLY the acknowledgment above, and only once. Never voice
+      any conditional/meta text describing how to handle this
       situation (e.g. "if they say remove me" or similar
       instruction-style phrasing) — that kind of text is internal
       guidance, not something to say out loud, even if it appears
@@ -1142,7 +1194,7 @@ _STAGE_TOOLS = {
     "objection": ["objection_result"],
     "booking": ["booking_result"],
     "disclosure": ["disclosure_result"],
-    "exit": ["opt_out"],
+    "exit": [],
 }
 
 
@@ -1162,7 +1214,6 @@ _STAGE_DECISION_POINTS = {
     "objection": ("objection_result", "resolving the objection and returning to still_interested/not_interested/wants_callback"),
     "booking": ("booking_result", "confirming callback details and completing booking"),
     "disclosure": ("disclosure_result", "resuming the stage this digression interrupted"),
-    "exit": ("opt_out", "acknowledging and ending the call"),
 }
 
 # KNOWN, LIVE GAP — not theoretical. Live testing (2026-07-21) confirmed the
@@ -1234,7 +1285,6 @@ class Aiva(SpeechSafetyMixin, Agent):
         # persistent, STT-committed turn count for the whole call).
         self._user_turn_count = 0
         self._last_agent_speech_turn_count = 0
-        self._exit_question_stamp = 0
 
         # PER-QUESTION VIOLATION COUNTER — see _require_confirmed_turn().
         # Counts consecutive _require_confirmed_turn() failures for the
@@ -1280,6 +1330,16 @@ class Aiva(SpeechSafetyMixin, Agent):
         # with its own window.
         self._no_tool_turn_streak = 0
         self._last_generation_had_tool_call = False
+
+        # REPEAT-REQUEST GUARD — see REPEAT_REQUEST_LIMIT and
+        # _is_repeat_of_previous() above. Independent counter, same reset
+        # points as _no_tool_turn_streak (tool call seen, _set_stage) — see
+        # there. _last_notool_assistant_text holds the previous no-tool
+        # turn's text (this stage only) so the next one can be compared
+        # against it; None means there is nothing yet to compare against
+        # (the first no-tool turn in a stage is never a "repeat").
+        self._repeat_request_streak = 0
+        self._last_notool_assistant_text = None
 
         # RETRY-STAMP SUPPRESSION — see _require_confirmed_turn()'s
         # escalation ladder and _on_conversation_item_added(). Set just
@@ -1345,6 +1405,8 @@ class Aiva(SpeechSafetyMixin, Agent):
         self.current_stage = stage
         self._violation_count = 0
         self._no_tool_turn_streak = 0
+        self._repeat_request_streak = 0
+        self._last_notool_assistant_text = None
         # TEMP DEBUG - remove after memory verification test
         self._stages_visited.append(stage)
         print(
@@ -1419,6 +1481,8 @@ class Aiva(SpeechSafetyMixin, Agent):
                         # generation's "had a tool call" signal was ever
                         # consumed — silently losing the reset.
                         self._no_tool_turn_streak = 0
+                        self._repeat_request_streak = 0
+                        self._last_notool_assistant_text = None
                     tool_call_seen = True
                     buffered_text = []
                     if has_text:
@@ -1483,26 +1547,95 @@ class Aiva(SpeechSafetyMixin, Agent):
                 self._suppress_stamp_update = False
             else:
                 self._last_agent_speech_turn_count = self._user_turn_count
-            # NO-TOOL DRIFT GUARD — see NO_TOOL_DRIFT_LIMIT above. Hello has
-            # no *_result tool and its own dedicated escalation loop, so it's
-            # excluded here. Orthogonal to the violation ladder below: that
-            # one only counts a tool call that WAS attempted and rejected;
-            # this one only counts turns where no tool call was attempted at
-            # all, so the two never fire on the same turn. The reset side of
-            # this (streak -> 0) now happens synchronously in llm_node() the
+            # NO-TOOL DRIFT GUARD — see NO_TOOL_DRIFT_LIMIT/
+            # _STAGE_DRIFT_LIMIT_OVERRIDE above. Hello has no *_result tool
+            # and its own dedicated escalation loop, so it's excluded here.
+            # Orthogonal to the violation ladder below: that one only counts
+            # a tool call that WAS attempted and rejected; this one only
+            # counts turns where no tool call was attempted at all, so the
+            # two never fire on the same turn. The reset side of this
+            # (streak -> 0) now happens synchronously in llm_node() the
             # instant a tool call streams past — see there — so this branch
             # only ever increments.
+            #
+            # REPEAT vs. DRIFT split — see REPEAT_REQUEST_LIMIT above. A
+            # no-tool turn that's a near-repeat of the immediately preceding
+            # no-tool turn (the model re-asking/rephrasing the same pending
+            # question, per REPEAT/CLARIFY and CONFUSED instructions) counts
+            # toward _repeat_request_streak instead of _no_tool_turn_streak —
+            # it's not "drift" (novel improvised content), and it's not
+            # legitimate script progress either (no new question was asked),
+            # it's the same question stalled with no real answer yet.
             if self.current_stage != "hello":
                 if not self._last_generation_had_tool_call:
-                    self._no_tool_turn_streak += 1
-                    if self._no_tool_turn_streak >= NO_TOOL_DRIFT_LIMIT and not self._call_ending:
-                        print(
-                            f"[NO-TOOL DRIFT] {self._no_tool_turn_streak} consecutive "
-                            f"turns in stage '{self.current_stage}' with no tool call "
-                            "— injecting correction."
-                        )
+                    text = item.text_content.strip()
+                    if self._is_repeat_of_previous(text):
+                        self._repeat_request_streak += 1
                         self._no_tool_turn_streak = 0
-                        asyncio.create_task(self._inject_drift_correction())
+                        if (
+                            self._repeat_request_streak >= REPEAT_REQUEST_LIMIT
+                            and not self._call_ending
+                        ):
+                            print(
+                                f"[REPEAT-REQUEST LOOP] {self._repeat_request_streak} "
+                                f"consecutive repeats in stage '{self.current_stage}' "
+                                "with no real answer — ending gracefully, no guessed "
+                                "outcome."
+                            )
+                            self._repeat_request_streak = 0
+                            asyncio.create_task(self._handle_repeat_loop())
+                    else:
+                        self._repeat_request_streak = 0
+                        self._no_tool_turn_streak += 1
+                        drift_limit = _STAGE_DRIFT_LIMIT_OVERRIDE.get(
+                            self.current_stage, NO_TOOL_DRIFT_LIMIT
+                        )
+                        if self._no_tool_turn_streak >= drift_limit and not self._call_ending:
+                            print(
+                                f"[NO-TOOL DRIFT] {self._no_tool_turn_streak} consecutive "
+                                f"turns in stage '{self.current_stage}' with no tool call "
+                                "— injecting correction."
+                            )
+                            self._no_tool_turn_streak = 0
+                            asyncio.create_task(self._inject_drift_correction())
+                    self._last_notool_assistant_text = text
+
+    def _is_repeat_of_previous(self, text: str) -> bool:
+        """True if `text` (a no-tool assistant turn, already stripped) is a
+        near-repeat of the immediately preceding no-tool assistant turn in
+        this stage — see REPEAT_REQUEST_LIMIT above. difflib is stdlib and
+        good enough here: the instructions explicitly tell the model to
+        "simply repeat or naturally rephrase the same question" on a
+        REPEAT/CLARIFY or CONFUSED turn, so a genuine repeat stays close to
+        the original wording; a genuinely new scripted question (e.g. TURN 1
+        -> RIGHT-PERSON CHECK) does not."""
+        if not self._last_notool_assistant_text:
+            return False
+        ratio = difflib.SequenceMatcher(
+            None, self._last_notool_assistant_text.lower(), text.lower()
+        ).ratio()
+        return ratio >= _REPEAT_SIMILARITY_THRESHOLD
+
+    async def _handle_repeat_loop(self):
+        """Ends the call gracefully after REPEAT_REQUEST_LIMIT consecutive
+        repeat/clarify turns with no real answer ever given — see
+        REPEAT_REQUEST_LIMIT above. Deliberately does NOT force tool_choice
+        on the stage's *_result tool the way _inject_drift_correction() does:
+        there is no real answer to base a result on here (the prospect only
+        ever asked to hear the question again), so forcing a *_result call
+        would just guess a wrong outcome via a different path than the bug
+        this is fixing. Reuses the same neutral, non-concluding closing
+        already used by _require_confirmed_turn()'s final-violation branch
+        below — "can't get a clear signal, end warmly" is exactly this
+        situation, already solved once."""
+        if self._call_ending:
+            return
+        self.call_result = "no_answer"
+        await self._end_call(
+            "Apologize briefly that the call isn't coming through clearly, "
+            "thank them for their time, and say goodbye. One short "
+            "sentence."
+        )
 
     async def _inject_drift_correction(self):
         """Forces the model back onto its stage's decision point after
@@ -1530,8 +1663,19 @@ class Aiva(SpeechSafetyMixin, Agent):
         Roll the stamp back to just before that last real user turn so the
         guard recognizes it as legitimate — this preserves the guard's
         actual purpose (never let the model answer its own brand-new
-        question with zero real user input) instead of bypassing it."""
+        question with zero real user input) instead of bypassing it.
+
+        Defense-in-depth: skips the rollback (and the forced call entirely)
+        if _repeat_request_streak is currently nonzero — that means the
+        turns leading here were repeats, not a real answer worth rescuing,
+        and _handle_repeat_loop() (a lower, separate threshold) is the
+        correct path for that case, not this one. Should rarely matter in
+        practice since REPEAT_REQUEST_LIMIT < every drift limit, so the
+        repeat-loop path fires first — this only guards unexpected ordering
+        across stages with different overrides."""
         if self._call_ending:
+            return
+        if self._repeat_request_streak > 0:
             return
         tool_name, decision = _STAGE_DECISION_POINTS.get(self.current_stage, (None, None))
         if not tool_name:
@@ -1560,20 +1704,16 @@ class Aiva(SpeechSafetyMixin, Agent):
             allow_interruptions=True,
         )
 
-    async def _require_confirmed_turn(self, since: int | None = None) -> bool:
+    async def _require_confirmed_turn(self) -> bool:
         """True if a genuine user turn was STT-committed after the relevant
-        question was last spoken. Defaults to checking against the live
-        _last_agent_speech_turn_count; pass `since` to check against a
-        frozen stamp instead (see opt_out, which fires immediately after
-        enter_exit's own acknowledgment with no new turn expected in
-        between — its real "confirmed turn" is the one that triggered
-        enter_exit, not one after the acknowledgment). If not confirmed,
-        re-prompts naturally and returns False — callers must return
-        immediately without advancing the stage or fabricating a result.
-        Also fails closed on _same_breath_violation (see llm_node()): a
-        confirmed prior user turn doesn't excuse the model asking a brand
-        new question and answering it itself in the same generation."""
-        stamp = self._last_agent_speech_turn_count if since is None else since
+        question was last spoken (checked against _last_agent_speech_turn_count).
+        If not confirmed, re-prompts naturally and returns False — callers
+        must return immediately without advancing the stage or fabricating
+        a result. Also fails closed on _same_breath_violation (see
+        llm_node()): a confirmed prior user turn doesn't excuse the model
+        asking a brand new question and answering it itself in the same
+        generation."""
+        stamp = self._last_agent_speech_turn_count
         same_breath = self._same_breath_violation
         self._same_breath_violation = False
         if self._user_turn_count > stamp and not same_breath:
@@ -1952,27 +2092,15 @@ class Aiva(SpeechSafetyMixin, Agent):
     # EXIT
     # --------------------------------------------------------
 
-    @function_tool()
-    async def enter_exit(self):
-        """Call when the prospect asks to be removed from the call list /
-        stop calling, before acknowledging."""
-        if self._call_ending:
-            return "Call already ending."
-        self._exit_question_stamp = self._last_agent_speech_turn_count
-        await self._set_stage("exit")
-        await self.session.generate_reply(
-            instructions="Acknowledge naturally and warmly, with a brief "
-            "thanks before the goodbye. Two sentences maximum."
-        )
-        return "Exit stage entered."
-
-    @function_tool()
-    async def opt_out(self):
-        """Call immediately after acknowledging the opt-out request."""
-        if self._call_ending:
-            return "Call already ending."
-        if not await self._require_confirmed_turn(since=self._exit_question_stamp):
-            return "No confirmed user turn since the opt-out request; re-prompted."
+    async def _do_opt_out(self):
+        """Suppress the lead and end the call. Runs as plain code right
+        after the exit acknowledgment finishes playing — not as a second
+        model-initiated tool call. generate_reply() called from inside a
+        function_tool defaults tool_choice to "none" for that generation
+        (LiveKit SDK behavior, agent_activity.py's _generate_reply), so a
+        second tool call was never actually reachable in the same turn;
+        the call would just hang silently after the acknowledgment. Driving
+        the outcome directly in code sidesteps that entirely."""
         if os.getenv("TEST_MODE", "false").lower() == "true":
             print(
                 "TEST MODE — suppression_list NOT updated. Would have added: "
@@ -1987,7 +2115,29 @@ class Aiva(SpeechSafetyMixin, Agent):
             )
         self.call_result = "suppressed"
         await self._end_call()
-        return "Opted out. Suppression logged. Call ended."
+
+    @function_tool()
+    async def enter_exit(self):
+        """Call when the prospect asks to be removed from the call list /
+        stop calling, before acknowledging."""
+        # Returns None throughout: any non-None return makes the SDK spawn
+        # an automatic follow-up reply (generation.py's reply_required =
+        # fnc_out is not None), and that follow-up reuses the tool list
+        # captured before this call ran (agent_activity.py's tool_response
+        # continuation doesn't refresh tools) — so it both duplicates the
+        # acknowledgment and re-offers enter_exit itself. Returning None
+        # skips that continuation entirely; the acknowledgment and ending
+        # are already fully handled below in code.
+        if self._call_ending:
+            return None
+        await self._set_stage("exit")
+        speech_handle = await self.session.generate_reply(
+            instructions="Acknowledge naturally and warmly, with a brief "
+            "thanks before the goodbye. Two sentences maximum."
+        )
+        await speech_handle.wait_for_playout()
+        await self._do_opt_out()
+        return None
 
 
 # ============================================================
