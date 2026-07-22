@@ -21,6 +21,8 @@ import json
 import asyncio
 import difflib
 import urllib.request
+from dataclasses import replace
+from typing import Literal
 from dotenv import load_dotenv
 from livekit.agents import (
     AgentSession,
@@ -288,7 +290,7 @@ GLOBAL_TURN_LIMIT = int(os.getenv("GLOBAL_TURN_LIMIT", "30"))
 WHOLE_CALL_VIOLATION_LIMIT = int(os.getenv("WHOLE_CALL_VIOLATION_LIMIT", "5"))
 
 # NO-TOOL DRIFT GUARD — see _on_conversation_item_added() and
-# _inject_drift_correction(). Catches PRODUCTIVE-seeming improvisation: the
+# _apply_pending_drift_correction(). Catches PRODUCTIVE-seeming improvisation: the
 # model carries a plausible pitch/qualifying/booking-style conversation in
 # pure free text for several turns without ever attempting the current
 # stage's *_result tool, so none of that stage's real script, funding math,
@@ -311,6 +313,47 @@ WHOLE_CALL_VIOLATION_LIMIT = int(os.getenv("WHOLE_CALL_VIOLATION_LIMIT", "5"))
 # preceding no-tool turn (see _is_repeat_of_previous()); repeats count
 # toward _repeat_request_streak instead and do not add to this one.
 NO_TOOL_DRIFT_LIMIT = int(os.getenv("NO_TOOL_DRIFT_LIMIT", "3"))
+
+# A direct request to speak with a human is a booking intent regardless of
+# which scripted stage is currently active. Keep this deliberately narrow:
+# it must describe arranging a call or explicitly asking for a human/advisor.
+_CALLBACK_REQUEST_RE = re.compile(
+    r"\b(?:set\s*up|schedule|book|arrange)\b.{0,40}\b(?:a\s+)?call(?:back)?\b"
+    r"|\b(?:speak|talk|connect)\b.{0,30}\b(?:human|advis[oe]r|sales\s+rep|representative)\b"
+    r"|\b(?:have|get)\b.{0,30}\b(?:human|advis[oe]r|sales\s+rep|representative)\b"
+    r".{0,20}\bcall\s+me\b",
+    re.IGNORECASE,
+)
+
+
+def _is_opener_disclosure(text: str) -> bool:
+    """True only for the opener's cold-call/AI disclosure."""
+    lowered = text.lower()
+    return "cold call" in lowered and bool(re.search(r"\b(?:an?\s+)?ai\b", lowered))
+
+
+OPENER_DISCLOSURE_LINE = (
+    "Hey, so I'll be upfront — this is a cold call, and I'm an AI assistant "
+    "calling for Porter Capital. Can I get 30 seconds? I'll be crisp. No "
+    "worries at all if now's not a good time."
+)
+OPENER_DISCLOSURE_CLARIFICATION_LINE = (
+    "Sure — this is a cold call from Porter Capital, and I'm an AI assistant. "
+    "Can I get 30 seconds?"
+)
+PITCH_OPENING_LINE = (
+    "So — Porter Capital here. Basically, we help businesses get working "
+    "capital — cash against their unpaid invoices, instead of waiting to get "
+    "paid. We've been doing this for decades and funded billions to businesses "
+    "nationwide. Worth a quick chat?"
+)
+QUALIFYING_OPENING_LINE = (
+    "Cool, glad you're interested. What type of business are you in?"
+)
+BOOKING_OPENING_LINE = (
+    "Great — let's get you set up with one of our advisors. What's the best "
+    "callback number and day or time for you?"
+)
 
 # Per-stage override for NO_TOOL_DRIFT_LIMIT. Opener is the one stage with a
 # mandatory MULTI-question shape before its own *_result tool is ever
@@ -575,9 +618,11 @@ def _opener_block(company: str, city: str, contact_name: str) -> str:
       ({contact_name}, if provided) are only for the TURN 1 confirmation
       question and the RIGHT-PERSON CHECK question — never say either again
       after that, they're internal context otherwise.
-    - After they respond to TURN 2, call opener_result — do not write it out
-      as text. The tool call itself is a separate, silent action, never part of
-      what you say out loud.
+    - After they respond to TURN 2, always call opener_result — do not write
+      anything as text. The tool call itself is a separate, silent action,
+      never part of what you say out loud. If they only ask you to repeat or
+      clarify TURN 2, call opener_result with result needs_clarification; the
+      tool will rephrase it safely without advancing the stage.
     - EVERY SINGLE ENDING of this stage — wrong number, no referral given,
       referral given, right-person declined at TURN 2 — MUST include a warm
       sign-off (e.g. "have a good day," "take care," "thanks so much") before
@@ -587,9 +632,9 @@ def _opener_block(company: str, city: str, contact_name: str) -> str:
       repeat, rephrase, or clarify what you just said — e.g. "what?", "can
       you repeat that?", "sorry, say that again?", "huh?") -> this is NOT an
       answer to classify. Simply repeat or naturally rephrase the same TURN 2
-      line. Do NOT call opener_result. Do NOT treat this as bad_timing,
-      not_interested, or any other classification below — it's a request to
-      hear it again, nothing more.
+      line by calling opener_result with result needs_clarification. Do NOT
+      treat this as bad_timing, not_interested, or any other classification
+      below — it's a request to hear it again, nothing more.
     - THIS RULE APPLIES AT TURN 2 ONLY, never at TURN 1 (TURN 1's wrong_number
       handling above is separate and already complete in itself — never apply
       anything below to TURN 1). At TURN 2, if the prospect says anything
@@ -1200,9 +1245,9 @@ _STAGE_TOOLS = {
 
 # ============================================================
 # NO-TOOL DRIFT GUARD — see NO_TOOL_DRIFT_LIMIT and
-# _inject_drift_correction(). Maps each stage to the tool it must resolve
+# _apply_pending_drift_correction(). Maps each stage to the tool it must resolve
 # through and a short description of that decision point, so the same
-# generic correction mechanism produces stage-appropriate wording instead of
+# generic correction produces stage-appropriate wording instead of
 # a one-size-fits-all (or opener-specific) instruction. "hello" is excluded
 # — it has no *_result tool and its own dedicated escalation loop.
 # ============================================================
@@ -1215,25 +1260,6 @@ _STAGE_DECISION_POINTS = {
     "booking": ("booking_result", "confirming callback details and completing booking"),
     "disclosure": ("disclosure_result", "resuming the stage this digression interrupted"),
 }
-
-# KNOWN, LIVE GAP — not theoretical. Live testing (2026-07-21) confirmed the
-# forced-tool_choice drift correction below can make the model guess a
-# specific, wrong outcome (e.g. qualifying_result(result="not_qualified")
-# from a prospect who only ever said "I'm not sure, I'd have to check with
-# my partner") when it's forced to resolve before it has enough real
-# information. qualifying_result now has an "unclear" escape hatch for
-# this (see _STAGE_INSUFFICIENT_INFO_VALUE below and its instruction text
-# in _inject_drift_correction). opener_result, pitch_result,
-# objection_result, disclosure_result, and booking_result do NOT have an
-# equivalent value yet — if drift correction ever fires in those stages,
-# they carry the SAME bad-guess risk, currently unaddressed. Add an
-# "unclear"-equivalent value to each (and a branch that just re-prompts
-# without ending the call or advancing the stage) before relying on forced
-# drift correction in those stages.
-_STAGE_INSUFFICIENT_INFO_VALUE = {
-    "qualifying": "unclear",
-}
-
 
 # ============================================================
 # THE SINGLE AGENT
@@ -1317,7 +1343,7 @@ class Aiva(SpeechSafetyMixin, Agent):
         self._same_breath_violation = False
 
         # NO-TOOL DRIFT GUARD — see NO_TOOL_DRIFT_LIMIT above and
-        # _inject_drift_correction(). Consecutive assistant turns, within the
+        # _apply_pending_drift_correction(). Consecutive assistant turns, within the
         # SAME stage, where the generation contained no tool call at all.
         # _no_tool_turn_streak is reset the instant a tool call is seen
         # streaming past in llm_node() itself (not deferred to a text-bearing
@@ -1330,6 +1356,15 @@ class Aiva(SpeechSafetyMixin, Agent):
         # with its own window.
         self._no_tool_turn_streak = 0
         self._last_generation_had_tool_call = False
+        # When the threshold is reached, remember the stage and current user
+        # turn count. The correction is added to the next normal generation
+        # only after a newer user message is present in llm_node's chat_ctx.
+        # It never starts a second assistant generation on its own.
+        self._pending_drift_correction = None
+        # Set after the cold-call/AI disclosure is actually generated. The
+        # stored user-turn count prevents silence/background generations from
+        # resolving opener without a newer prospect response.
+        self._opener_result_armed_at_user_turn = None
 
         # REPEAT-REQUEST GUARD — see REPEAT_REQUEST_LIMIT and
         # _is_repeat_of_previous() above. Independent counter, same reset
@@ -1407,6 +1442,8 @@ class Aiva(SpeechSafetyMixin, Agent):
         self._no_tool_turn_streak = 0
         self._repeat_request_streak = 0
         self._last_notool_assistant_text = None
+        self._pending_drift_correction = None
+        self._opener_result_armed_at_user_turn = None
         # TEMP DEBUG - remove after memory verification test
         self._stages_visited.append(stage)
         print(
@@ -1428,6 +1465,20 @@ class Aiva(SpeechSafetyMixin, Agent):
     # --------------------------------------------------------
 
     async def llm_node(self, chat_ctx, tools, model_settings):
+        if await self._route_explicit_callback_request(chat_ctx):
+            # AgentActivity captured the old stage's tools before entering
+            # this hook. Use booking's tools for this same natural response.
+            tools = self._current_tools()
+        else:
+            self._apply_pending_drift_correction(chat_ctx)
+            if self._opener_result_is_due(chat_ctx):
+                model_settings = replace(
+                    model_settings,
+                    tool_choice={
+                        "type": "function",
+                        "function": {"name": "opener_result"},
+                    },
+                )
         # Text can't be un-spoken once yielded: the SDK forwards each
         # delta.content chunk to the TTS channel the instant it's yielded
         # (see generation.py's perform_llm_inference), so by the time a
@@ -1502,9 +1553,59 @@ class Aiva(SpeechSafetyMixin, Agent):
             else:
                 yield chunk
         if buffered_text and not tool_call_seen:
-            yield ChatChunk(id="buffered-text", delta=ChoiceDelta(content="".join(buffered_text)))
+            final_text = "".join(buffered_text)
+            if self.current_stage == "opener" and _is_opener_disclosure(final_text):
+                self._opener_result_armed_at_user_turn = self._user_turn_count
+                final_text = OPENER_DISCLOSURE_LINE
+            yield ChatChunk(id="buffered-text", delta=ChoiceDelta(content=final_text))
         # Consumed by _on_conversation_item_added() — see NO_TOOL_DRIFT_LIMIT.
         self._last_generation_had_tool_call = tool_call_seen
+
+    def _opener_result_is_due(self, chat_ctx) -> bool:
+        armed_at = self._opener_result_armed_at_user_turn
+        if self.current_stage != "opener" or armed_at is None:
+            return False
+        chat_user_turn_count = sum(
+            1
+            for item in chat_ctx.items
+            if isinstance(item, ChatMessage) and item.role == "user"
+        )
+        return chat_user_turn_count > armed_at
+
+    async def _route_explicit_callback_request(self, chat_ctx) -> bool:
+        """Move an explicit human-callback request directly to booking.
+
+        This intent outranks the current script stage. In particular, a stale
+        opener must never interpret "set up a call with an advisor" as the
+        prospect saying somebody else handles funding.
+        """
+        if self._call_ending or self.current_stage in {"booking", "exit"}:
+            return False
+
+        latest_user_text = next(
+            (
+                item.text_content.strip()
+                for item in reversed(chat_ctx.items)
+                if isinstance(item, ChatMessage)
+                and item.role == "user"
+                and item.text_content.strip()
+            ),
+            "",
+        )
+        if not _CALLBACK_REQUEST_RE.search(latest_user_text):
+            return False
+
+        await self._set_stage("booking")
+        chat_ctx.add_message(
+            role="system",
+            content=(
+                "The prospect explicitly asked to schedule a call with a human "
+                "advisor. Treat this as booking intent, not a gatekeeper referral. "
+                "Acknowledge it and ask for their best callback number and day/time. "
+                "Do not ask who the right person is and do not end the call."
+            ),
+        )
+        return True
 
     # --------------------------------------------------------
     # TURN-COUNTER GUARD — see __init__ for field docs.
@@ -1517,6 +1618,20 @@ class Aiva(SpeechSafetyMixin, Agent):
         if not item.text_content or not item.text_content.strip():
             return
         if item.role == "user":
+            metrics = item.metrics or {}
+            eou_delay = metrics.get("end_of_turn_delay")
+            transcription_delay = metrics.get("transcription_delay")
+            if eou_delay is not None or transcription_delay is not None:
+                eou_text = f"{eou_delay:.3f}s" if eou_delay is not None else "n/a"
+                stt_text = (
+                    f"{transcription_delay:.3f}s"
+                    if transcription_delay is not None
+                    else "n/a"
+                )
+                print(
+                    f"[TURN LATENCY] stage={self.current_stage} "
+                    f"end_of_turn={eou_text} transcription={stt_text}"
+                )
             self._user_turn_count += 1
             # GLOBAL TURN-COUNT SAFETY NET — see GLOBAL_TURN_LIMIT above.
             # Independent of tool calls entirely: fires purely off the real
@@ -1594,10 +1709,13 @@ class Aiva(SpeechSafetyMixin, Agent):
                             print(
                                 f"[NO-TOOL DRIFT] {self._no_tool_turn_streak} consecutive "
                                 f"turns in stage '{self.current_stage}' with no tool call "
-                                "— injecting correction."
+                                "— correcting on the next user turn."
                             )
                             self._no_tool_turn_streak = 0
-                            asyncio.create_task(self._inject_drift_correction())
+                            self._pending_drift_correction = (
+                                self.current_stage,
+                                self._user_turn_count,
+                            )
                     self._last_notool_assistant_text = text
 
     def _is_repeat_of_previous(self, text: str) -> bool:
@@ -1620,7 +1738,7 @@ class Aiva(SpeechSafetyMixin, Agent):
         """Ends the call gracefully after REPEAT_REQUEST_LIMIT consecutive
         repeat/clarify turns with no real answer ever given — see
         REPEAT_REQUEST_LIMIT above. Deliberately does NOT force tool_choice
-        on the stage's *_result tool the way _inject_drift_correction() does:
+        on the stage's *_result tool the way the old immediate correction did:
         there is no real answer to base a result on here (the prospect only
         ever asked to hear the question again), so forcing a *_result call
         would just guess a wrong outcome via a different path than the bug
@@ -1637,71 +1755,45 @@ class Aiva(SpeechSafetyMixin, Agent):
             "sentence."
         )
 
-    async def _inject_drift_correction(self):
-        """Forces the model back onto its stage's decision point after
-        NO_TOOL_DRIFT_LIMIT consecutive turns of free-text-only conversation
-        with no *_result tool attempt — see NO_TOOL_DRIFT_LIMIT above. This
-        is what catches PRODUCTIVE-seeming improvisation (a plausible
-        pitch/qualifying/booking-style conversation carried entirely in free
-        text) that the confirmed-turn violation ladder can't, since that
-        ladder only ever sees a turn where a tool call WAS attempted.
+    def _apply_pending_drift_correction(self, chat_ctx):
+        """Guide the next natural reply after drift without creating one.
 
-        tool_choice pins the model's next generation to the stage's own
-        *_result tool at the provider API level (OpenAI and Groq both honor
-        named tool_choice — Groq's LLM plugin is a thin subclass of the
-        OpenAI plugin pointed at Groq's OpenAI-compatible endpoint, so this
-        is the same code path for both our primary and failover LLM) —
-        turning this from a hopeful nudge into a real requirement instead of
-        just asking nicely and hoping the model complies next turn.
-
-        The drifted turns already contain real user answers the model never
-        acted on — _last_agent_speech_turn_count was re-stamped after each
-        of those no-tool assistant turns, so _require_confirmed_turn()
-        (called inside the *_result tool this forces) would otherwise see
-        "no user turn since the question was last asked" and bounce the
-        forced call even though the prospect DID just answer something real.
-        Roll the stamp back to just before that last real user turn so the
-        guard recognizes it as legitimate — this preserves the guard's
-        actual purpose (never let the model answer its own brand-new
-        question with zero real user input) instead of bypassing it.
-
-        Defense-in-depth: skips the rollback (and the forced call entirely)
-        if _repeat_request_streak is currently nonzero — that means the
-        turns leading here were repeats, not a real answer worth rescuing,
-        and _handle_repeat_loop() (a lower, separate threshold) is the
-        correct path for that case, not this one. Should rarely matter in
-        practice since REPEAT_REQUEST_LIMIT < every drift limit, so the
-        repeat-loop path fires first — this only guards unexpected ordering
-        across stages with different overrides."""
-        if self._call_ending:
+        LiveKit places the new user message in the llm_node chat context
+        before it emits conversation_item_added for that message. Comparing
+        chat-context user turns therefore avoids both event-order races and
+        back-to-back assistant generations.
+        """
+        pending = self._pending_drift_correction
+        if pending is None:
             return
-        if self._repeat_request_streak > 0:
+
+        stage, previous_user_turn_count = pending
+        if self._call_ending or stage != self.current_stage:
+            self._pending_drift_correction = None
             return
-        tool_name, decision = _STAGE_DECISION_POINTS.get(self.current_stage, (None, None))
+
+        chat_user_turn_count = sum(
+            1
+            for item in chat_ctx.items
+            if isinstance(item, ChatMessage) and item.role == "user"
+        )
+        if chat_user_turn_count <= previous_user_turn_count:
+            return
+
+        self._pending_drift_correction = None
+        tool_name, decision = _STAGE_DECISION_POINTS.get(stage, (None, None))
         if not tool_name:
             return
-        if self._user_turn_count > 0:
-            self._last_agent_speech_turn_count = self._user_turn_count - 1
 
-        insufficient_info_value = _STAGE_INSUFFICIENT_INFO_VALUE.get(self.current_stage)
-        escape_hatch = (
-            f" If they genuinely haven't given you enough real information "
-            f"to decide accurately, call {tool_name} with result set to "
-            f"'{insufficient_info_value}' rather than guessing a specific "
-            f"outcome."
-            if insufficient_info_value
-            else ""
-        )
-        await self.session.generate_reply(
-            tool_choice={"type": "function", "function": {"name": tool_name}},
-            instructions=(
-                f"You have had several exchanges in this stage without "
-                f"{decision}. You must call {tool_name} now. Base its "
-                "arguments strictly on what the prospect has actually said "
-                "in this conversation — do not guess, invent, or assume "
-                f"anything they did not say.{escape_hatch}"
+        chat_ctx.add_message(
+            role="system",
+            content=(
+                f"The conversation has gone several exchanges without {decision}. "
+                "Respond to the prospect's newest message now. If it provides enough "
+                f"information to resolve this stage, call {tool_name}. If it does not, "
+                "ask exactly one specific clarifying question. Do not guess, invent, "
+                "or assume an outcome, and do not produce an extra response."
             ),
-            allow_interruptions=True,
         )
 
     async def _require_confirmed_turn(self) -> bool:
@@ -1852,11 +1944,23 @@ class Aiva(SpeechSafetyMixin, Agent):
     # --------------------------------------------------------
 
     @function_tool()
-    async def opener_result(self, result: str, referral_details: str = ""):
+    async def opener_result(
+        self,
+        result: Literal[
+            "interested",
+            "not_interested",
+            "bad_timing",
+            "wrong_number",
+            "hung_up",
+            "gatekeeper_referral",
+            "needs_clarification",
+        ],
+        referral_details: str = "",
+    ):
         """Call once the opener flow (TURN 1 through TURN 2) reaches a
         conclusion.
         result: interested / not_interested / bad_timing / wrong_number /
-        hung_up / gatekeeper_referral.
+        hung_up / gatekeeper_referral / needs_clarification.
         referral_details: the name/contact info they gave for the right
         person, only when result is gatekeeper_referral."""
         print(
@@ -1864,9 +1968,31 @@ class Aiva(SpeechSafetyMixin, Agent):
             f"referral_details={referral_details!r} call_ending={self._call_ending}"
         )
         if self._call_ending:
-            return "Call already ending."
+            return None
         if not await self._require_confirmed_turn():
-            return "No confirmed user turn since the question was asked; re-prompted."
+            return None
+
+        valid_results = {
+            "interested",
+            "not_interested",
+            "bad_timing",
+            "wrong_number",
+            "hung_up",
+            "gatekeeper_referral",
+            "needs_clarification",
+        }
+        if result not in valid_results:
+            result = "needs_clarification"
+
+        if result == "needs_clarification":
+            self._opener_result_armed_at_user_turn = self._user_turn_count
+            await self.session.say(
+                OPENER_DISCLOSURE_CLARIFICATION_LINE,
+                allow_interruptions=True,
+            )
+            return None
+
+        self._opener_result_armed_at_user_turn = None
 
         if result == "gatekeeper_referral":
             print(f"[Gatekeeper referral] {self._company}: {referral_details}")
@@ -1877,7 +2003,7 @@ class Aiva(SpeechSafetyMixin, Agent):
                 'call in one short sentence — e.g. "Got it, thanks so much '
                 '— have a great day!"'
             )
-            return "Gatekeeper referral provided. Call ended."
+            return None
         if result == "wrong_number":
             await self.session.generate_reply(
                 instructions='Apologize briefly for the mix-up and add a warm '
@@ -1887,31 +2013,30 @@ class Aiva(SpeechSafetyMixin, Agent):
             )
             self.call_result = "not_interested"
             await self._end_call()
-            return "Wrong number at company confirmation. Call ended."
+            return None
         if result == "not_interested":
             self.call_result = "not_interested"
             await self._end_call(
                 "Acknowledge warmly that's fine, and end the call in one "
                 "short sentence."
             )
-            return "Prospect declined. Call ended."
+            return None
         if result == "bad_timing":
             await self._end_call_bad_timing()
-            return "Bad timing at open. Marked callback_later. Call ended."
+            return None
         if result == "hung_up":
             self.call_result = "no_answer"
             await self._end_call()
-            return "Prospect hung up. Call ended."
+            return None
 
         # interested
         self.call_result = "contacted"
         await self._set_stage("pitch")
-        await self.session.generate_reply(
-            instructions="Deliver the short pitch now, including one "
-            "natural differentiator. Keep it tight and conversational, "
-            "then ask the soft check-in question."
+        await self.session.say(
+            PITCH_OPENING_LINE,
+            allow_interruptions=True,
         )
-        return "Opener done, interested. Pitch delivered."
+        return None
 
     # --------------------------------------------------------
     # PITCH
@@ -1922,18 +2047,18 @@ class Aiva(SpeechSafetyMixin, Agent):
         """result: interested / objection. objection_text: what they said,
         if result is objection."""
         if self._call_ending:
-            return "Call already ending."
+            return None
         if not await self._require_confirmed_turn():
-            return "No confirmed user turn since the question was asked; re-prompted."
+            return None
         if result == "objection":
             await self._raise_objection(objection_text)
-            return "Objection raised from pitch."
+            return None
         await self._set_stage("qualifying")
-        await self.session.generate_reply(
-            instructions="Start qualifying naturally. Acknowledge what they "
-            "said first."
+        await self.session.say(
+            QUALIFYING_OPENING_LINE,
+            allow_interruptions=True,
         )
-        return "Pitch accepted. Qualifying started."
+        return None
 
     # --------------------------------------------------------
     # QUALIFYING
@@ -1948,34 +2073,33 @@ class Aiva(SpeechSafetyMixin, Agent):
         information yet to decide — never as a way to avoid a decision you
         could actually make from what they already said."""
         if self._call_ending:
-            return "Call already ending."
+            return None
         if not await self._require_confirmed_turn():
-            return "No confirmed user turn since the question was asked; re-prompted."
+            return None
         if result == "unclear":
             await self.session.generate_reply(
                 instructions="You don't have enough real information yet "
                 "to decide. Ask the one specific question you still "
                 "need — do not guess."
             )
-            return "Unclear — insufficient information, asked clarifying question."
+            return None
         if result == "objection":
             await self._raise_objection(objection_text)
-            return "Objection raised from qualifying."
+            return None
         if result == "not_qualified":
             self.call_result = "not_interested"
             await self._end_call(
                 "Acknowledge warmly, thank them for their time, and end the "
                 "call in one short sentence."
             )
-            return "Not qualified. Call ended."
+            return None
         # qualified
         await self._set_stage("booking")
-        await self.session.generate_reply(
-            instructions="React warmly to their agreement. Ask for callback "
-            "preference naturally, using the soft closing line about "
-            "getting them set up with an advisor."
+        await self.session.say(
+            BOOKING_OPENING_LINE,
+            allow_interruptions=True,
         )
-        return "Qualified. Booking started."
+        return None
 
     # --------------------------------------------------------
     # OBJECTION — a digression from pitch/qualifying/booking, not a
@@ -1998,30 +2122,34 @@ class Aiva(SpeechSafetyMixin, Agent):
         """result: still_interested / not_interested / bad_timing /
         wants_callback"""
         if self._call_ending:
-            return "Call already ending."
+            return None
         if not await self._require_confirmed_turn():
-            return "No confirmed user turn since the question was asked; re-prompted."
+            return None
         if result == "not_interested":
             self.call_result = "not_interested"
             await self._end_call(
                 "Acknowledge warmly, wish them well, and end the call in "
                 "one short sentence."
             )
-            return "Not interested. Call ended."
+            return None
         if result == "bad_timing":
             await self._end_call_bad_timing()
-            return "Bad timing. Marked callback_later. Call ended."
+            return None
         if result == "wants_callback":
             await self._set_stage("booking")
-            await self.session.generate_reply(
-                instructions="React warmly to their agreement. Ask for "
-                "callback preference naturally, using the soft closing line "
-                "about getting them set up with an advisor."
+            await self.session.say(
+                BOOKING_OPENING_LINE,
+                allow_interruptions=True,
             )
-            return "Objection resolved to booking."
+            return None
         # still_interested — resume whatever stage the objection interrupted
         await self._set_stage(self._return_stage or "qualifying")
-        return f"Objection handled, still interested. Resumed {self.current_stage}."
+        await self.session.generate_reply(
+            instructions="Resume the current stage naturally. Acknowledge what "
+            "they said and ask the next appropriate question without repeating "
+            "anything already covered."
+        )
+        return None
 
     # --------------------------------------------------------
     # BOOKING
@@ -2031,9 +2159,9 @@ class Aiva(SpeechSafetyMixin, Agent):
     async def booking_result(self, callback_details: str):
         """Call when callback details are confirmed."""
         if self._call_ending:
-            return "Call already ending."
+            return None
         if not await self._require_confirmed_turn():
-            return "No confirmed user turn since the question was asked; re-prompted."
+            return None
         self.call_result = "callback_booked"
         self.callback_details = callback_details
         await self._end_call(
@@ -2042,7 +2170,7 @@ class Aiva(SpeechSafetyMixin, Agent):
             "our advisors will call them then. Thank them for their time "
             "and say goodbye. Two sentences maximum."
         )
-        return "Booking confirmed. Call ended."
+        return None
 
     # --------------------------------------------------------
     # DISCLOSURE — a digression, same pattern as objection.
@@ -2053,40 +2181,44 @@ class Aiva(SpeechSafetyMixin, Agent):
         """Call when the prospect asks whether you are human or an AI, to
         switch to the disclosure script before answering."""
         if self._call_ending:
-            return "Call already ending."
+            return None
         self._return_stage = self.current_stage
         await self._set_stage("disclosure")
         await self.session.generate_reply(
             instructions="Answer honestly. Be warm and unbothered about "
             "being an AI."
         )
-        return "Disclosure stage entered."
+        return None
 
     @function_tool()
     async def disclosure_result(self, reaction: str):
         """reaction: accepted / wants_human / wants_to_end"""
         if self._call_ending:
-            return "Call already ending."
+            return None
         if not await self._require_confirmed_turn():
-            return "No confirmed user turn since the question was asked; re-prompted."
+            return None
         if reaction == "wants_human":
             await self._set_stage("booking")
-            await self.session.generate_reply(
-                instructions="React warmly to their agreement. Ask for "
-                "callback preference naturally, using the soft closing line "
-                "about getting them set up with an advisor."
+            await self.session.say(
+                BOOKING_OPENING_LINE,
+                allow_interruptions=True,
             )
-            return "Wants human. Booking started."
+            return None
         if reaction == "wants_to_end":
             self.call_result = "not_interested"
             await self._end_call(
                 "Acknowledge warmly that's fine, thank them, and end the "
                 "call in one short sentence."
             )
-            return "Prospect wants to end after disclosure. Call ended."
+            return None
         # accepted — resume whatever stage disclosure interrupted
         await self._set_stage(self._return_stage or "opener")
-        return f"Disclosure accepted. Resumed {self.current_stage}."
+        await self.session.generate_reply(
+            instructions="Resume the current stage naturally. Acknowledge what "
+            "they said and ask the next appropriate question without repeating "
+            "anything already covered."
+        )
+        return None
 
     # --------------------------------------------------------
     # EXIT
@@ -2367,6 +2499,7 @@ async def when_call_starts(ctx: JobContext):
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(
         entrypoint_fnc=when_call_starts,
+        agent_name="codex-agent",
         prewarm_fnc=prewarm_qwen,
         job_executor_type=JobExecutorType.PROCESS,
         num_idle_processes=1,

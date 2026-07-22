@@ -1,87 +1,95 @@
-# ponytail: minimal self-check for the forced tool_choice drift-correction
-# fix (_inject_drift_correction in agent_v2.py). Verifies the plumbing this
-# change touches: the right *_result tool is force-selected per stage, and
-# the guard conditions (call ending / no decision point for this stage)
-# still skip correctly. Does NOT make a live LLM call — whether OpenAI/Groq
-# actually honor named tool_choice is confirmed via their docs and the
-# installed livekit-plugins-groq source (a thin subclass of the OpenAI
-# plugin), not re-verified here. Run: python test_drift_correction.py
+# ponytail: deterministic regression for deferred no-tool drift correction.
 
-import asyncio
+from types import SimpleNamespace
 
 import agent_v2
-from agent_v2 import Aiva, _STAGE_DECISION_POINTS, _STAGE_INSUFFICIENT_INFO_VALUE
-
-# Aiva.session is a read-only property (inherited from Agent) that reaches
-# into a live LiveKit activity/session we don't have in a unit test. Shadow
-# it on Aiva with a plain settable property, backed by _fake_session, for
-# this process only.
-Aiva.session = property(
-    lambda self: self._fake_session,
-    lambda self, v: setattr(self, "_fake_session", v),
-)
+from agent_v2 import Aiva
+from livekit.agents.llm import ChatMessage
 
 
-class FakeSession:
-    def __init__(self):
-        self.calls = []
+class FakeChatContext:
+    def __init__(self, user_turn_count):
+        self.items = [
+            ChatMessage(role="user", content=[f"user turn {n}"])
+            for n in range(user_turn_count)
+        ]
+        self.added = []
 
-    async def generate_reply(self, **kwargs):
-        self.calls.append(kwargs)
+    def add_message(self, **kwargs):
+        self.added.append(kwargs)
 
 
-def _make_aiva(user_turn_count=5):
-    aiva = Aiva.__new__(Aiva)  # skip __init__ (needs a real JobContext/session)
+def _make_aiva(stage, user_turn_count=3):
+    aiva = Aiva.__new__(Aiva)
+    aiva.current_stage = stage
     aiva._call_ending = False
-    aiva.session = FakeSession()
     aiva._user_turn_count = user_turn_count
-    aiva._last_agent_speech_turn_count = user_turn_count  # as if just re-stamped
+    aiva._last_agent_speech_turn_count = user_turn_count
+    aiva._suppress_stamp_update = False
+    aiva._last_generation_had_tool_call = False
+    aiva._no_tool_turn_streak = agent_v2.NO_TOOL_DRIFT_LIMIT - 1
+    aiva._repeat_request_streak = 0
+    aiva._last_notool_assistant_text = "A completely different prior response."
+    aiva._pending_drift_correction = None
     return aiva
 
 
+def _cross_drift_threshold(aiva):
+    event = SimpleNamespace(
+        item=ChatMessage(
+            role="assistant",
+            content=["Are you happy with your provider, or has it been a struggle?"],
+        )
+    )
+    # This deliberately runs without an event loop. The old implementation
+    # called asyncio.create_task() here and therefore created the extra reply.
+    aiva._on_conversation_item_added(event)
+
+
+def _check_stage(stage, expected_tool):
+    aiva = _make_aiva(stage)
+    _cross_drift_threshold(aiva)
+
+    assert aiva._pending_drift_correction == (stage, 3)
+    assert aiva._no_tool_turn_streak == 0
+
+    # An explicit/system generation before another user turn must not consume
+    # the correction or create any guidance.
+    chat_ctx = FakeChatContext(user_turn_count=3)
+    aiva._apply_pending_drift_correction(chat_ctx)
+    assert chat_ctx.added == []
+    assert aiva._pending_drift_correction == (stage, 3)
+
+    # The next real user message makes the correction part of that one normal
+    # response. It guides rather than forces, so unclear input cannot be
+    # fabricated into a business outcome.
+    chat_ctx.items.append(ChatMessage(role="user", content=["new answer"]))
+    aiva._apply_pending_drift_correction(chat_ctx)
+    assert aiva._pending_drift_correction is None
+    assert len(chat_ctx.added) == 1
+    correction = chat_ctx.added[0]
+    assert correction["role"] == "system"
+    assert expected_tool in correction["content"]
+    assert "do not guess" in correction["content"].lower()
+
+    # One pending correction is consumed once, never duplicated.
+    aiva._apply_pending_drift_correction(chat_ctx)
+    assert len(chat_ctx.added) == 1
+
+
 def _check():
-    # every real stage forces exactly its own *_result tool, and rolls the
-    # confirmed-turn stamp back one user turn (see _inject_drift_correction)
-    for stage, (tool_name, _decision) in _STAGE_DECISION_POINTS.items():
-        aiva = _make_aiva()
-        aiva.current_stage = stage
-        asyncio.run(aiva._inject_drift_correction())
-        assert len(aiva.session.calls) == 1, f"{stage}: expected one generate_reply call"
-        tool_choice = aiva.session.calls[0].get("tool_choice")
-        assert tool_choice == {"type": "function", "function": {"name": tool_name}}, (
-            f"{stage}: tool_choice was {tool_choice!r}, expected forced {tool_name!r}"
-        )
-        assert aiva._last_agent_speech_turn_count == aiva._user_turn_count - 1, (
-            f"{stage}: stamp was not rolled back to just before the last real user turn"
-        )
+    _check_stage("qualifying", "qualifying_result")
+    _check_stage("objection", "objection_result")
 
-        instructions = aiva.session.calls[0].get("instructions", "")
-        insufficient_value = _STAGE_INSUFFICIENT_INFO_VALUE.get(stage)
-        if insufficient_value:
-            assert insufficient_value in instructions, (
-                f"{stage}: expected the '{insufficient_value}' escape hatch "
-                "mentioned in the corrective instructions"
-            )
-        else:
-            assert "rather than guessing" not in instructions, (
-                f"{stage}: has no insufficient-info value yet, must not "
-                "reference an escape hatch that doesn't exist"
-            )
+    aiva = _make_aiva("qualifying")
+    aiva._pending_drift_correction = ("qualifying", 3)
+    aiva.current_stage = "booking"
+    chat_ctx = FakeChatContext(user_turn_count=4)
+    aiva._apply_pending_drift_correction(chat_ctx)
+    assert aiva._pending_drift_correction is None
+    assert chat_ctx.added == []
 
-    # a stage with no decision point (e.g. "hello") must not force anything
-    aiva = _make_aiva()
-    aiva.current_stage = "hello"
-    asyncio.run(aiva._inject_drift_correction())
-    assert aiva.session.calls == [], "hello has no *_result tool, must not force one"
-
-    # _call_ending must short-circuit before any generate_reply call
-    aiva = _make_aiva()
-    aiva.current_stage = "pitch"
-    aiva._call_ending = True
-    asyncio.run(aiva._inject_drift_correction())
-    assert aiva.session.calls == [], "_call_ending must skip the forced call entirely"
-
-    print(f"{agent_v2.__name__}: all drift-correction tool_choice checks passed")
+    print(f"{agent_v2.__name__}: deferred drift-correction checks passed")
 
 
 if __name__ == "__main__":

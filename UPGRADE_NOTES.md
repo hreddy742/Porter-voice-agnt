@@ -1,52 +1,103 @@
 # Upgrade Tracker
 
-## Deterministic stage progression: forced tool_choice + stamp rollback + qualifying's "unclear" value (2026-07-21)
-Closes out the no-tool-drift root-cause fix (previously `NO_TOOL_DRIFT_LIMIT`
-was a backstop nudge only). `_inject_drift_correction()` (agent_v2.py) now:
+## Per-turn endpoint latency is visible before tuning (2026-07-22)
+The historical transcript showed a delayed user-turn commit but could not
+distinguish endpoint/VAD delay from transcription delay. LiveKit 1.6.4 already
+attaches both measurements to each committed user `ChatMessage`; `agent_v2.py`
+now prints them as one `[TURN LATENCY]` line with the active stage. This is
+read-only instrumentation and does not change VAD, STT, endpointing, or reply
+behavior. Endpoint settings remain unchanged until a real phone call supplies
+the missing evidence.
 
-- Forces the stage's own `*_result` tool via `tool_choice={"type":
-  "function", "function": {"name": tool_name}}` on the corrective
-  `generate_reply()` call, instead of just asking nicely. Confirmed
-  supported by both OpenAI and Groq (our primary/failover pair) —
-  `livekit.plugins.groq.LLM` is a thin subclass of the OpenAI plugin
-  pointed at Groq's OpenAI-compatible endpoint, same code path for both.
-- Rolls `_last_agent_speech_turn_count` back to `_user_turn_count - 1`
-  before firing the forced call. Without this, `_require_confirmed_turn()`
-  (called inside every `*_result` tool) silently discarded the forced
-  call's effect — it saw "no user turn since the question was last asked"
-  because that stamp gets re-set after every assistant turn, including the
-  drifted no-tool ones, even though a real user answer had just arrived.
-  The rollback fixes the specific case (real answer already given, never
-  acted on) without weakening the guard's actual purpose (never let the
-  model answer its own brand-new question with zero real user input).
-- `qualifying_result` gained a fourth `result` value, `unclear`, plus
-  instruction text telling the model to base arguments strictly on what
-  was actually said and use `unclear` rather than guess a specific outcome
-  when it genuinely doesn't have enough information yet.
+## Deterministic stage transitions no longer make a second LLM call (2026-07-22)
+The interested/qualified/callback tool branches already knew both the next
+stage and its opening sentence, but they asked the LLM to generate that
+sentence again. Each affected turn therefore waited for two sequential LLM
+calls before TTS could start.
 
-**Validated live against real gpt-4o-mini**, not just unit-tested plumbing:
-reproduced the exact drift scenario (3 no-tool turns in `qualifying`, then
-forced resolution) via `test_drift_correction_live_manual.py`. Confirmed:
-`current_stage` now actually advances after the forced call (previously
-stuck), and a vague/insufficient-info conversation correctly produced
-`qualifying_result(result="unclear", ...)` with a genuine follow-up
-question instead of a fabricated `not_qualified` guess.
+Those five branches now use LiveKit `say()` with reviewed, interruptible
+opening lines for pitch, qualifying, and booking. Dynamic questions,
+objections, answers, and closing decisions still use the LLM. Every function
+tool still returns `None`, preserving the single-response-owner fix.
 
-Known limits, explicitly not resolved by this change:
-- **Sample size**: validated on one clean run per scenario, not a large
-  sample. LLM output isn't perfectly deterministic — occasional bad
-  guesses in Scenario-B-style (vague/insufficient-info) cases are reduced,
-  not proven eliminated. Re-run `test_drift_correction_live_manual.py` if
-  a similar bad-guess incident shows up in production transcripts.
-- **Only `qualifying_result` has the `unclear` escape hatch.**
-  `opener_result`, `pitch_result`, `objection_result`, `disclosure_result`,
-  and `booking_result` do NOT — if drift correction ever forces one of
-  those tools, it carries the same forced-too-early bad-guess risk
-  demonstrated above, currently unaddressed. See the comment above
-  `_STAGE_INSUFFICIENT_INFO_VALUE` in agent_v2.py.
-- `NO_TOOL_DRIFT_LIMIT`, the whole-call violation counter
-  (`_total_violation_count`), and `GLOBAL_TURN_LIMIT` are all kept
-  unchanged as backstops, not replaced.
+Validation against the installed LiveKit 1.6.4 stack and GPT-4o-mini produced
+exactly one pitch after one tool call. Three new transition samples averaged
+1.153 seconds through the LLM/tool path. Combined with the separately measured
+Cartesia first-audio average of 0.371 seconds, estimated time to first audio is
+about 1.52 seconds, down from the prior measured 3.12-second two-LLM path
+(about 1.60 seconds / 51% lower), excluding endpoint detection.
+
+## Critical opener wording is deterministic (2026-07-21)
+The opener's compliance/state-control language no longer depends on model
+wording. When the model reaches the cold-call/AI disclosure, `llm_node()`
+substitutes one exact reviewed sentence before text reaches transcription or
+TTS. The `needs_clarification` tool path uses LiveKit `say()` with one exact
+clarification sentence, so it cannot paraphrase, omit the AI disclosure, or
+accidentally pitch.
+
+The real GPT/LiveKit opener diagnostic asserts exact recorded assistant text
+for both lines and passed, alongside the interested and not-interested state
+transitions. Ordinary pitch/qualifying wording remains intentionally dynamic;
+only business-critical control language is locked.
+
+## Opener must resolve after the AI/time disclosure (2026-07-21)
+Call 27 exposed that the prompt alone did not guarantee stage progression:
+after Aiva delivered the cold-call/AI disclosure, GPT spoke a pitch without
+calling `opener_result`, leaving all 27 persisted turns incorrectly stamped
+as `opener`.
+
+The agent now arms an opener-result requirement only after that disclosure is
+actually generated. LiveKit is given a named `opener_result` tool choice only
+when a newer user message is present, so silence/background generations cannot
+classify the prospect. `result` is a constrained enum, including the safe
+`needs_clarification` outcome; that outcome rephrases the disclosure and stays
+in opener instead of guessing.
+
+Real GPT/LiveKit validation covered all three critical branches:
+- "I just got ten seconds" -> `interested`, then `opener -> pitch`;
+- "What do you mean?" -> `needs_clarification`, remains in opener;
+- clear "not interested" -> `not_interested`, closes without pitching.
+
+## Explicit human-callback intent bypasses stale stages (2026-07-21)
+Production call 27 remained in `opener` while the conversation improvised into
+rates and factoring. When the prospect explicitly asked to set up a call with
+a sales rep/advisor, stale opener instructions interpreted that as a
+gatekeeper referral and ended the call with `final_call_result='contacted'`.
+
+`agent_v2.py` now recognizes a narrow set of explicit scheduling/human-advisor
+requests before normal inference and moves directly to `booking`. The same
+natural response uses booking's tools and asks for callback number/day/time;
+it cannot ask for the "right person" or take the referral-ending branch.
+
+Validated with a deterministic regression using call 27's exact wording,
+negative and idempotency cases, and a real GPT/LiveKit run starting from a
+deliberately stale opener. The live run transitioned `opener -> booking`,
+produced exactly one callback-details question, and did not end the call.
+
+## Drift correction deferred to the next user turn (2026-07-21)
+Live call 25 proved the old forced correction was unsafe. On the third
+no-tool assistant turn it started a background `generate_reply()` immediately,
+before the prospect answered the question just asked. In qualifying this
+created a second assistant reply; in objection it forced a guessed
+`not_interested` result and ended an interested call.
+
+The guard now records a pending correction instead of generating anything.
+`llm_node()` applies one ephemeral, stage-aware instruction only when its
+`chat_ctx` contains a newer user message. The instruction asks the model to
+call the stage tool when the new answer is sufficient, or ask one specific
+clarifying question when it is not. It does not force `tool_choice`, roll back
+turn stamps, or create a second response owner.
+
+Validated three ways:
+- deterministic qualifying and objection regressions reproduce the exact
+  three-turn threshold and prove no task/reply is created;
+- the correction does not apply without a newer user message and is consumed
+  exactly once when that message arrives;
+- the real GPT/LiveKit diagnostic passed both stages: no unsolicited reply
+  after the threshold, and at most one assistant reply on the next user turn.
+
+`NO_TOOL_DRIFT_LIMIT`, the whole-call violation counter, and
+`GLOBAL_TURN_LIMIT` remain unchanged as independent backstops.
 
 ## Same-breath fix confirmed final; LiveKit "structured output" does not apply (2026-07-21)
 Investigated replacing the llm_node() buffer-and-discard same-breath fix
@@ -256,12 +307,12 @@ is available.
   `tool_call_seen` value already computed there for the same-breath guard).
   Resets to 0 on any tool call and on every `_set_stage()` (a new stage is
   a fresh decision-point window). At `NO_TOOL_DRIFT_LIMIT` (3) consecutive
-  no-tool turns, `_inject_drift_correction()` forces a strong corrective
-  instruction telling the model to stop general conversation and either
-  resolve the current stage's decision point now (naming its actual
-  `*_result` tool) or ask the specific question needed to do so — wording
-  is generic and stage-aware via `_STAGE_DECISION_POINTS`, not
-  opener-specific. Orthogonal to the violation ladder by construction: a
+  no-tool turns, the guard arms a stage-aware corrective instruction for the
+  next real user turn. It tells the model to resolve the current stage when
+  the new answer is sufficient, or ask the specific missing question without
+  guessing. It never starts another assistant generation itself. Wording is
+  generic and stage-aware via `_STAGE_DECISION_POINTS`, not opener-specific.
+  Orthogonal to the violation ladder by construction: a
   given turn either has a tool call attempt or doesn't, so the two
   mechanisms can never fire on the same turn.
 - KNOWN, DELIBERATE GAP: `agent.py`'s `AgentTask` architecture has NO

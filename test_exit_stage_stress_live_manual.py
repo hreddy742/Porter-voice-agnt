@@ -73,8 +73,8 @@ async def run_trial(i, phrase):
     # keeps firing its own generate_reply() calls on a 3.5s timer, racing
     # against our scripted turn and contaminating the transcript with
     # spurious tool calls unrelated to the Exit fix under test. Same
-    # test-harness-artifact class as test_drift_correction_live_manual.py's
-    # neutered _inject_drift_correction — not a production bug, since
+    # test-harness artifact class as the drift-correction live diagnostic's
+    # neutered startup — not a production bug, since
     # production always genuinely starts at "hello".
     async def _noop_on_enter():
         pass
