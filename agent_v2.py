@@ -361,7 +361,8 @@ BOOKING_OPENING_LINE = (
 # CHECK -> TURN 2 is up to 4 legitimate, mutually-DIFFERENT (not
 # text-similar, so not absorbed by the repeat/drift split above) no-tool
 # turns on a totally clean call with zero drift and zero repeats (verified
-# live 2026-07-21 — see test_opener_cleanpath_live_manual.py). The default
+# live 2026-07-21 — see tests/manual/test_opener_cleanpath_live_manual.py).
+# The default
 # limit of 3 fires exactly when TURN 2 is spoken, before the prospect has
 # said anything about it. 5 is the tight minimum that never fires during
 # that legitimate 4-turn chain and still catches one genuine no-tool turn
@@ -1503,7 +1504,7 @@ class Aiva(SpeechSafetyMixin, Agent):
         # of the response before it completes; (2) API-level prevention via
         # tool_choice constraints — confirmed unavailable across OpenAI,
         # xAI/Grok, and Gemini APIs (all checked, sources in
-        # UPGRADE_NOTES.md); the only constraint that guarantees no bundled
+        # docs/UPGRADE_NOTES.md); the only constraint that guarantees no bundled
         # text (tool_choice='required') is incompatible with normal
         # conversational replies. Measured cost: ~130-215ms added latency
         # per substantive turn, negligible on short utterances. This cost is

@@ -652,7 +652,7 @@ class OpenerTask(SpeechSafetyMixin, AgentTask):
         # during that playback, heard_speech would already be set by the time
         # wait_for is reached, so it'd return instantly on false ground and
         # this loop would silently exit after attempt 0 — no attempt 2, no
-        # timeout, no hangup. See UPGRADE_NOTES.md for the known AEC
+        # timeout, no hangup. See docs/UPGRADE_NOTES.md for the known AEC
         # limitation this works around.
         # Aiva always speaks first — attempt 0 (spoken as "Hello?") is
         # unconditional, never a silent wait for their own greeting.
