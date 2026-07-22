@@ -1,15 +1,32 @@
-﻿from db import get_next_lead
+import asyncio
 
-lead = get_next_lead()
+from dotenv import load_dotenv
 
-if lead:
-    print('Lead found:')
-    print('  Company :', lead['company_name'])
-    print('  Location:', lead['city'], lead['state'])
-    print('  Industry:', lead['industry'])
-    print('  Phone   :', lead['phone'])
-    print('  Tier    :', lead['tier'])
-    print('  Score   :', lead['current_score'])
-    print('  Why Now :', lead['why_now_summary'])
-else:
-    print('No leads available in database right now')
+from app.infrastructure.database import PostgresRepository
+
+
+async def main() -> None:
+    load_dotenv()
+    repository = await PostgresRepository.connect()
+    try:
+        lead = await repository.get_next_lead()
+    finally:
+        await repository.close()
+    if not lead:
+        print("No leads available in database right now")
+        return
+    for label, key in (
+        ("Company", "company_name"),
+        ("City", "city"),
+        ("State", "state"),
+        ("Industry", "industry"),
+        ("Phone", "phone"),
+        ("Tier", "tier"),
+        ("Score", "current_score"),
+        ("Why Now", "why_now_summary"),
+    ):
+        print(f"{label}: {lead[key]}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

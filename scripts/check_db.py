@@ -1,40 +1,37 @@
-﻿import psycopg2
-from dotenv import load_dotenv
-import os
+import asyncio
 
-load_dotenv()
+from scripts.db_utils import connect
 
-conn = psycopg2.connect(
-    host="localhost",
-    port=5432,
-    database="porter_leads",
-    user="porter",
-    password=os.getenv("DB_PASSWORD", "")
-)
-cursor = conn.cursor()
 
-print('--- Total companies ---')
-cursor.execute("SELECT COUNT(*) FROM companies")
-print(cursor.fetchone()[0])
+async def main() -> None:
+    connection = await connect()
+    try:
+        checks = (
+            ("Total companies", "SELECT COUNT(*) AS count FROM companies"),
+            (
+                "Lead candidates by sales status",
+                "SELECT sales_status AS label, COUNT(*) AS count FROM lead_candidates GROUP BY sales_status",
+            ),
+            (
+                "Lead candidates by tier",
+                "SELECT tier AS label, COUNT(*) AS count FROM lead_candidates GROUP BY tier",
+            ),
+            (
+                "Contactability statuses",
+                "SELECT contactability_status AS label, COUNT(*) AS count FROM company_contactability GROUP BY contactability_status",
+            ),
+            (
+                "Companies with phone numbers",
+                "SELECT COUNT(*) AS count FROM company_contactability WHERE phone IS NOT NULL",
+            ),
+        )
+        for title, query in checks:
+            print(f"--- {title} ---")
+            for row in await connection.fetch(query):
+                print(dict(row))
+    finally:
+        await connection.close()
 
-print('--- Lead candidates by sales_status ---')
-cursor.execute("SELECT sales_status, COUNT(*) FROM lead_candidates GROUP BY sales_status")
-for row in cursor.fetchall():
-    print(' ', row[0], ':', row[1])
 
-print('--- Lead candidates by tier ---')
-cursor.execute("SELECT tier, COUNT(*) FROM lead_candidates GROUP BY tier")
-for row in cursor.fetchall():
-    print(' ', row[0], ':', row[1])
-
-print('--- Contactability status counts ---')
-cursor.execute("SELECT contactability_status, COUNT(*) FROM company_contactability GROUP BY contactability_status")
-for row in cursor.fetchall():
-    print(' ', row[0], ':', row[1])
-
-print('--- Companies with phone numbers ---')
-cursor.execute("SELECT COUNT(*) FROM company_contactability WHERE phone IS NOT NULL")
-print(cursor.fetchone()[0])
-
-cursor.close()
-conn.close()
+if __name__ == "__main__":
+    asyncio.run(main())

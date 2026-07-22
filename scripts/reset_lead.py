@@ -1,27 +1,25 @@
-﻿import psycopg2
-from dotenv import load_dotenv
-import os
+import asyncio
 
-load_dotenv()
+from scripts.db_utils import connect
 
-conn = psycopg2.connect(
-    host="localhost", port=5432,
-    database="porter_leads",
-    user="porter",
-    password=os.getenv("DB_PASSWORD", "")
-)
-cursor = conn.cursor()
 
-cursor.execute("""
-    UPDATE lead_candidates
-    SET sales_status = 'research', recontact_at = NULL, updated_at = now()
-    WHERE company_id = (
-        SELECT id FROM companies
-        WHERE canonical_name = 'Apex Staffing Solutions'
-    )
-""")
+async def main() -> None:
+    connection = await connect()
+    try:
+        result = await connection.execute(
+            """
+            UPDATE lead_candidates
+            SET sales_status = 'research', recontact_at = NULL, updated_at = now()
+            WHERE company_id = (
+                SELECT id FROM companies
+                WHERE canonical_name = 'Apex Staffing Solutions'
+            )
+            """
+        )
+        print(result)
+    finally:
+        await connection.close()
 
-conn.commit()
-print(f"Rows updated: {cursor.rowcount}")
-cursor.close()
-conn.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())

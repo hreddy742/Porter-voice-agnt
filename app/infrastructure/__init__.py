@@ -1,0 +1,2 @@
+"""External persistence adapters."""
+

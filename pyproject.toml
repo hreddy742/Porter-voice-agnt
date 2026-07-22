@@ -1,0 +1,16 @@
+[project]
+name = "porter-voice-agnt"
+version = "0.1.0"
+description = "Self-hosted LiveKit outbound voice agent for Porter Capital"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "asyncpg==0.30.0",
+    "livekit-agents==1.6.4",
+    "livekit-api==1.1.1",
+    "livekit-local-inference==0.2.6",
+    "livekit-plugins-cartesia==1.6.4",
+    "livekit-plugins-deepgram==1.6.4",
+    "livekit-plugins-openai==1.6.4",
+    "python-dotenv==1.2.2",
+]
