@@ -1,10 +1,11 @@
 ﻿# ============================================================
 # leads.py — Database connection for Porter Capital Voice Agent
 # ============================================================
-# This file does three things:
+# This file does four things:
 #   1. get_next_lead()       → find the best lead to call
-#   2. update_lead_status()  → write call result back to DB
-#   3. add_to_suppression()  → log opt-outs immediately
+#   2. get_lead_by_id()      → re-fetch a specific lead already selected
+#   3. update_lead_status()  → write call result back to DB
+#   4. add_to_suppression()  → log opt-outs immediately
 #
 # Connected via app.config.Settings (.env DB_* → local porter DB)
 # ============================================================
@@ -118,6 +119,72 @@ def get_next_lead() -> Lead | None:
     conn   = get_connection()
     cursor = conn.cursor()
     cursor.execute(query)
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+
+    if row is None:
+        return None
+
+    return Lead(
+        company_name=row[0],
+        city=row[1],
+        state=row[2],
+        industry=row[3],
+        naics_code=row[4],
+        website_domain=row[5],
+        phone=row[6],
+        lead_candidate_id=str(row[7]),
+        tier=row[8],
+        current_score=row[9],
+        why_now_summary=row[10],
+    )
+
+
+def get_lead_by_id(lead_candidate_id: str) -> Lead | None:
+    """
+    Re-fetches a specific, already-selected lead by id.
+
+    Used so the lead dialer.py actually rings and the lead the agent worker
+    builds its persona/context from are guaranteed to be the SAME one.
+    dialer.py calls get_next_lead() once at dial time, dials that lead's
+    real phone number, and tags the LiveKit room with its
+    lead_candidate_id. worker.py's when_call_starts() then calls this
+    function with that id instead of independently calling get_next_lead()
+    again — which would risk picking a *different* lead than the one
+    Twilio actually connected, if the lead list changed between dial time
+    and call-answer time.
+
+    Unlike get_next_lead(), this does not re-apply the active/suppression/
+    sector filters — the lead was already vetted once, at dial time.
+
+    Returns a Lead model, or None if no lead with that id exists.
+    """
+
+    query = """
+        SELECT
+            c.canonical_name        AS company_name,
+            c.city,
+            c.state,
+            c.industry,
+            c.naics_code,
+            c.website_domain,
+            cc.phone,
+            lc.id                   AS lead_candidate_id,
+            lc.tier,
+            lc.current_score,
+            lc.why_now_summary
+        FROM lead_candidates lc
+        JOIN companies c
+            ON c.id = lc.company_id
+        JOIN company_contactability cc
+            ON cc.lead_candidate_id = lc.id
+        WHERE lc.id = %s
+    """
+
+    conn   = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(query, (lead_candidate_id,))
     row = cursor.fetchone()
     cursor.close()
     conn.close()
