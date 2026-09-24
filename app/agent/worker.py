@@ -20,7 +20,7 @@ from livekit.plugins import deepgram, silero
 
 from app.agent.providers import OLLAMA_BASE_URL, OLLAMA_KEEP_ALIVE, get_llm, get_tts
 from app.agent.supervisor import PorterSupervisor
-from app.db import get_next_lead, update_lead_status
+from app.db import get_lead_by_id, get_next_lead, update_lead_status
 
 load_dotenv()
 
@@ -66,7 +66,17 @@ async def when_call_starts(ctx: JobContext):
 
     global current_lead
 
-    lead_model = get_next_lead()
+    # dialer.py tags the room it creates with the lead_candidate_id it
+    # actually dialed (see app/calling/dialer.py
+    # create_room_and_dispatch_aiva()). Using that same id here — instead
+    # of independently calling get_next_lead() again — guarantees the lead
+    # Aiva has context on is the SAME one Twilio connected, not whichever
+    # lead happens to be "next" by the time this worker picks up the job.
+    # Falls back to get_next_lead() only when there's no metadata to read,
+    # which covers `python agent.py console` local testing, where there's
+    # no real dialed room to tag.
+    dialed_lead_id = ctx.room.metadata or None
+    lead_model = get_lead_by_id(dialed_lead_id) if dialed_lead_id else get_next_lead()
 
     if lead_model is None:
         print("No leads available.")
@@ -169,4 +179,3 @@ def run_worker() -> None:
 
 if __name__ == "__main__":
     run_worker()
-
